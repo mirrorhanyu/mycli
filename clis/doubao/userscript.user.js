@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.3.0
+// @version      0.4.0
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.3.0";
+  const VERSION = "0.4.0";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -33,7 +33,12 @@
   const ANSWER_TIMEOUT_MS = 120000;
   const PODCAST_TIMEOUT_MS = 10 * 60 * 1000;
   const MIN_AUDIO_BYTES = 64 * 1024;
-  const STABLE_MS = 2500;
+  const STABLE_MS = 3500;
+  // Doubao's markdown renderer is debounced: even after the "停止生成" button
+  // disappears (network stream ended), tokens keep flushing into the DOM for
+  // another 1–5 seconds. Require the "done" signal to be stable for this long
+  // before trusting it, so we don't return a truncated answer.
+  const POST_DONE_QUIET_MS = 8000;
 
   let busy = false;
   let lastStatus = "";
@@ -913,13 +918,21 @@
     throw new Error(lastAudioError ? `Timed out waiting for podcast audio: ${lastAudioError}` : "Timed out waiting for podcast download button");
   }
 
-  async function waitForAnswer(prompt, baselineCount, baselineAnswer) {
+  async function waitForAnswer(prompt, baselineCount, baselineAnswer, timeoutMs) {
     const started = Date.now();
+    const totalTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : ANSWER_TIMEOUT_MS;
     let best = "";
     let stableSince = 0;
+    // doneSince = the moment isGenerating() most recently transitioned to
+    // false. Reset to 0 whenever the stop button reappears or text grows
+    // (text growing means the renderer is still flushing, regardless of
+    // what the button says).
+    let doneSince = 0;
     let lastDebugAt = 0;
 
-    while (Date.now() - started < ANSWER_TIMEOUT_MS) {
+    while (Date.now() - started < totalTimeoutMs) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       becomeWorker();
       const candidates = collectAnswerCandidates(prompt);
@@ -930,16 +943,36 @@
       if (current && current !== best) {
         best = current;
         stableSince = Date.now();
+        // Text just grew → renderer is still working, don't trust any
+        // earlier "done" observation.
+        doneSince = 0;
         setStatus(`receiving answer\n${best.slice(0, 80)}`);
         continue;
       }
+
+      const generating = isGenerating();
+      if (generating) {
+        doneSince = 0;
+      } else if (!doneSince) {
+        doneSince = Date.now();
+      }
+
+      const stableFor = stableSince ? Date.now() - stableSince : 0;
+      const doneFor = doneSince ? Date.now() - doneSince : 0;
+      // Return only when BOTH:
+      //   - we have an answer that hasn't changed for STABLE_MS, AND
+      //   - the stop button has been gone for at least POST_DONE_QUIET_MS.
+      // The post-done quiet period lets Doubao's debounced markdown
+      // renderer drain its queue after the network stream ends.
+      if (best && stableFor > STABLE_MS && doneFor > POST_DONE_QUIET_MS) {
+        return best;
+      }
+
       if (Date.now() - lastDebugAt > 3000) {
         lastDebugAt = Date.now();
-        setStatus(`waiting answer\ncandidates=${candidates.length} baseline=${baselineCount}\nlatest=${(current || "").slice(0, 60)}`);
-      }
-      const stableMs = isGenerating() ? Math.max(STABLE_MS, 6000) : STABLE_MS;
-      if (best && stableSince && Date.now() - stableSince > stableMs) {
-        return best;
+        setStatus(
+          `waiting answer\nlen=${best.length} stable=${(stableFor / 1000).toFixed(1)}s done=${(doneFor / 1000).toFixed(1)}s\nlatest=${(current || "").slice(0, 60)}`,
+        );
       }
     }
 
@@ -980,9 +1013,10 @@
     if (sendButton) sendButton.click();
     else pressEnter(input);
 
+    const waitMs = Number(args.wait_ms) || 0;
     const answer = isPodcast
       ? await waitForPodcastDownloadButton(podcastDownloadBaseline, cmd.id)
-      : await waitForAnswer(prompt, baselineCount, baselineAnswer);
+      : await waitForAnswer(prompt, baselineCount, baselineAnswer, waitMs);
 
     setStatus(`done\n${cmd.id.slice(0, 8)}`);
     return answer;
