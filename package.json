@@ -1,0 +1,19 @@
+{
+  "name": "mycli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local browser-bridge CLI with micro-daemon + WebSocket transport. Tampermonkey on the page side.",
+  "bin": {
+    "mycli": "./bin/mycli.js"
+  },
+  "scripts": {
+    "check": "node --check src/daemon.js && node --check src/daemon-client.js && node --check src/registry.js && node --check bin/mycli.js && node --check clis/doubao/index.js && node --check clis/doubao/ask.js && node --check clis/doubao/podcast.js && node --check clis/doubao/userscript.user.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "UNLICENSED"
+}
