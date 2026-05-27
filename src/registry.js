@@ -23,7 +23,15 @@ function listCommands(site) {
 }
 
 function listSites() {
-  return [...new Set([...registry.values()].map((spec) => spec.site))].sort();
+  const sites = new Set([...registry.values()].map((spec) => spec.site));
+  if (fs.existsSync(CLIS_DIR)) {
+    for (const entry of fs.readdirSync(CLIS_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith(".") || entry.name.startsWith("_")) continue;
+      sites.add(entry.name);
+    }
+  }
+  return [...sites].sort();
 }
 
 function loadSite(site) {

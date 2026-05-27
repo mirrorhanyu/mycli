@@ -19,6 +19,8 @@ const HEARTBEAT_MS = 15000;
 
 // site -> { ws, version, contextId, lastSeenAt }
 const sitePeers = new Map();
+// site -> { cookie, updatedAt, contextId, url }
+const siteSessions = new Map();
 // command_id -> { site, action, args, resolve, reject, timer, dispatched }
 const pending = new Map();
 
@@ -102,6 +104,29 @@ function failAllForSite(site, message) {
     pending.delete(id);
     entry.reject(new Error(message));
   }
+}
+
+function sessionSummary(site, session) {
+  return {
+    site,
+    hasCookie: Boolean(session?.cookie),
+    updatedAt: Number(session?.updatedAt) || 0,
+    contextId: session?.contextId || null,
+    url: session?.url || null,
+  };
+}
+
+function upsertSiteSession(site, payload = {}) {
+  const cookie = String(payload.cookie || "").trim();
+  if (!cookie) return null;
+  const session = {
+    cookie,
+    updatedAt: Number(payload.updatedAt) > 0 ? Number(payload.updatedAt) : Date.now(),
+    contextId: payload.contextId ? String(payload.contextId) : null,
+    url: payload.url ? String(payload.url) : null,
+  };
+  siteSessions.set(site, session);
+  return session;
 }
 
 function mimeFromPath(filePath) {
@@ -289,12 +314,14 @@ async function handleRequest(req, res) {
         lastSeenAt: entry.lastSeenAt,
         pending: [...pending.values()].filter((p) => p.site === site).length,
       }));
+    const sessions = [...siteSessions.entries()].map(([site, session]) => sessionSummary(site, session));
     sendJson(req, res, 200, {
       ok: true,
       pid: process.pid,
       uptime: process.uptime(),
       port: PORT,
       sites,
+      sessions,
       pending: pending.size,
     });
     return;
@@ -434,6 +461,23 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    if (msg.type === "session_update") {
+      const site = String(msg.site || registeredSite || "").trim();
+      if (!site) return;
+      if (registeredSite && site !== registeredSite) return;
+      const peer = sitePeers.get(site);
+      if (peer && peer.ws === ws) {
+        peer.lastSeenAt = Date.now();
+      }
+      upsertSiteSession(site, {
+        cookie: msg?.data?.cookie,
+        updatedAt: msg?.data?.updatedAt,
+        contextId: msg.contextId || peer?.contextId || null,
+        url: msg?.data?.url,
+      });
+      return;
+    }
+
     if (msg.type === "log") {
       log(`[${registeredSite || "ws"}] ${msg.level || "info"}: ${msg.msg || ""}`);
       return;
@@ -486,6 +530,7 @@ function shutdown() {
     entry.reject(new Error("Daemon shutting down"));
   }
   pending.clear();
+  siteSessions.clear();
   for (const [, entry] of sitePeers) {
     try { entry.ws.close(); } catch {}
   }
