@@ -114,11 +114,24 @@ async function daemonSubcommand(sub) {
   }
   if (sub === "logs") {
     const fs = require("node:fs");
+    const follow = process.argv.slice(3).some((a) => a === "-f" || a === "--follow");
     if (!fs.existsSync(LOG_PATH)) {
-      console.log("(no log yet)");
+      if (!follow) {
+        console.log("(no log yet)");
+        return;
+      }
+      fs.writeFileSync(LOG_PATH, "");
+    }
+    if (!follow) {
+      process.stdout.write(fs.readFileSync(LOG_PATH, "utf8"));
       return;
     }
-    process.stdout.write(fs.readFileSync(LOG_PATH, "utf8"));
+    const { spawn } = require("node:child_process");
+    const child = spawn("tail", ["-n", "200", "-f", LOG_PATH], { stdio: "inherit" });
+    const stop = () => { try { child.kill("SIGINT"); } catch {} };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+    await new Promise((resolve) => child.on("exit", resolve));
     return;
   }
   console.error(`Unknown daemon subcommand: ${sub}`);

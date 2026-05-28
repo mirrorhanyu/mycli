@@ -333,13 +333,21 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // Serve the userscript for installation: GET /userscript/<site>/mycli.user.js
+  // Serve the userscript for installation: GET/HEAD /userscript/<site>/mycli.user.js
   const userscriptMatch = pathname.match(/^\/userscript\/([^/]+)\/mycli\.user\.js$/);
-  if (req.method === "GET" && userscriptMatch) {
+  if ((req.method === "GET" || req.method === "HEAD") && userscriptMatch) {
     const site = userscriptMatch[1];
     const file = userscriptPath(site);
     if (!fs.existsSync(file)) {
       sendText(req, res, 404, `Unknown site: ${site}`);
+      return;
+    }
+    if (req.method === "HEAD") {
+      res.writeHead(200, {
+        "content-type": "application/javascript; charset=utf-8",
+        ...corsHeaders(req),
+      });
+      res.end();
       return;
     }
     sendText(req, res, 200, fs.readFileSync(file, "utf8"), "application/javascript");

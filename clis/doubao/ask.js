@@ -15,16 +15,30 @@ function promptFromOptions(options) {
   throw new Error("Missing --text or --file");
 }
 
+function pickWaitMs(options) {
+  // Accept both --timeout_ms (long form, matches daemon API) and --wait
+  // (short form). --timeout_ms wins if both are given. Default 5 min.
+  const raw =
+    options.timeout_ms !== undefined && options.timeout_ms !== true
+      ? options.timeout_ms
+      : options.wait !== undefined && options.wait !== true
+        ? options.wait
+        : null;
+  if (raw === null) return DEFAULT_WAIT_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`Invalid --timeout_ms/--wait value: ${raw}`);
+  }
+  return value;
+}
+
 defineCommand({
   site: "doubao",
   name: "ask",
   description: "Send a prompt to Doubao and print the answer.",
   async run({ options, sendCommand, site }) {
     const prompt = promptFromOptions(options);
-    const waitMs = options.wait && options.wait !== true ? Number(options.wait) : DEFAULT_WAIT_MS;
-    if (!Number.isFinite(waitMs) || waitMs <= 0) {
-      throw new Error(`Invalid --wait value: ${options.wait}`);
-    }
+    const waitMs = pickWaitMs(options);
 
     const result = await sendCommand({
       site,

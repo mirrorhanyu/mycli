@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.4.0
+// @version      0.4.1
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.4.0";
+  const VERSION = "0.4.1";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -633,7 +633,16 @@
         return visible(element);
       });
 
-    return elements
+    // Doubao nests markdown blocks inside a md-box-root container. Both
+    // selectors match, so we'd return the inner-most paragraph as the
+    // "latest" candidate by bottom — which truncates the answer to just
+    // the last block. Keep only the outermost container so innerText
+    // covers the whole message.
+    const outermost = elements.filter((element) =>
+      !elements.some((other) => other !== element && other.contains(element)),
+    );
+
+    return outermost
       .map((element) => ({
         text: meaningfulText(element.innerText || element.textContent || "", prompt),
         bottom: element.getBoundingClientRect().bottom,
@@ -1018,7 +1027,7 @@
       ? await waitForPodcastDownloadButton(podcastDownloadBaseline, cmd.id)
       : await waitForAnswer(prompt, baselineCount, baselineAnswer, waitMs);
 
-    setStatus(`done\n${cmd.id.slice(0, 8)}`);
+    setStatus(`done\n${cmd.id.slice(0, 8)}\nlen=${typeof answer === "string" ? answer.length : "?"}`);
     return answer;
   }
 
