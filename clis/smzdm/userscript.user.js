@@ -1,22 +1,29 @@
 // ==UserScript==
 // @name         mycli SMZDM Bridge
 // @namespace    local.mycli.smzdm
-// @version      0.2.0
+// @version      0.3.4
 // @description  WebSocket bridge to the mycli micro-daemon. Syncs the current SMZDM session and saves drafts through browser-side APIs.
-// @match        https://post.smzdm.com/*
+// @match        https://post.smzdm.com/post/*
+// @match        https://post.smzdm.com/edit/*
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @downloadURL  http://127.0.0.1:17872/userscript/smzdm/mycli.user.js
 // @updateURL    http://127.0.0.1:17872/userscript/smzdm/mycli.user.js
 // @connect      127.0.0.1
 // @connect      localhost
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
   "use strict";
 
   const SITE = "smzdm";
-  const VERSION = "0.2.0";
+  const VERSION = "0.3.4";
+  const AUTOSAVE_URL_RE = /\/api\/editor\/article\/(submit|save)|\/api\/draft\//;
+  // Tampermonkey sandboxes the script when any GM_* grant is declared. Page
+  // globals like `editor` live on the real page window, accessible via
+  // `unsafeWindow`. Fall back to `window` when running unsandboxed.
+  const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -56,7 +63,20 @@
         "max-width:280px",
         "white-space:pre-wrap",
       ].join(";");
-      document.documentElement.appendChild(box);
+      const mount = document.body || document.documentElement || document.head;
+      if (mount) {
+        mount.appendChild(box);
+      } else {
+        const mountLater = () => {
+          const target = document.body || document.documentElement || document.head;
+          if (!target) {
+            requestAnimationFrame(mountLater);
+            return;
+          }
+          target.appendChild(box);
+        };
+        requestAnimationFrame(mountLater);
+      }
     }
     box.textContent = `mycli/${SITE} ${VERSION}\n${text}`;
   }
@@ -102,6 +122,10 @@
     );
   }
 
+  function logStep(msg) {
+    sendWs({ type: "log", level: "info", msg: `[draft] ${msg}` });
+  }
+
   function currentSession() {
     const cookie = String(document.cookie || "").trim();
     if (!cookie) return null;
@@ -141,28 +165,6 @@
     setStatus(`connected, session synced\n${reason}`);
   }
 
-  function requestJson(url, options = {}) {
-    return fetch(url, {
-      credentials: "include",
-      headers: {
-        accept: "*/*",
-        "x-requested-with": "XMLHttpRequest",
-        ...(options.headers || {}),
-      },
-      ...options,
-    }).then(async (res) => {
-      const text = await res.text();
-      let payload = null;
-      try {
-        payload = text ? JSON.parse(text) : null;
-      } catch {}
-      if (!res.ok) {
-        throw new Error((payload && payload.error_msg) || `HTTP ${res.status}`);
-      }
-      return payload;
-    });
-  }
-
   function fetchAttachmentArrayBuffer(urlPath) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -183,206 +185,279 @@
     });
   }
 
-  async function createOrReuseDraft() {
-    const payload = await requestJson("/ajax_create_caogao");
-    if (payload?.error_code !== 0 || !payload?.data) {
-      throw new Error(payload?.error_msg || "无法创建草稿");
-    }
-    return String(payload.data);
+  function getArticleId() {
+    return String(document.querySelector("#article_id")?.value || "").trim();
   }
 
-  async function fetchToken() {
-    const payload = await requestJson("/api/editor/get_token");
-    const token = payload?.data?.token;
-    if (payload?.error_code !== 0 || !token) {
-      throw new Error(payload?.error_msg || "无法获取投稿 token");
+  function installAutosaveWatcher() {
+    if (pageWindow.__mycliSmzdmAutosave) return pageWindow.__mycliSmzdmAutosave;
+    const state = {
+      pending: 0,
+      lastStartedAt: 0,
+      lastCompletedAt: 0,
+      lastStatus: 0,
+      lastUrl: "",
+    };
+
+    const XHR = pageWindow.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+      const origOpen = XHR.prototype.open;
+      XHR.prototype.open = function (method, url) {
+        this.__mycliAutosave = AUTOSAVE_URL_RE.test(String(url || ""));
+        this.__mycliAutosaveUrl = String(url || "");
+        return origOpen.apply(this, arguments);
+      };
+      const origSend = XHR.prototype.send;
+      XHR.prototype.send = function () {
+        if (this.__mycliAutosave) {
+          state.pending += 1;
+          state.lastStartedAt = Date.now();
+          state.lastUrl = this.__mycliAutosaveUrl;
+          const done = () => {
+            state.pending = Math.max(0, state.pending - 1);
+            state.lastCompletedAt = Date.now();
+            state.lastStatus = this.status || 0;
+          };
+          this.addEventListener("loadend", done);
+        }
+        return origSend.apply(this, arguments);
+      };
     }
-    return String(token);
+
+    const origFetch = pageWindow.fetch;
+    if (typeof origFetch === "function") {
+      pageWindow.fetch = function (input, init) {
+        const url = typeof input === "string" ? input : input && input.url;
+        const isAutosave = AUTOSAVE_URL_RE.test(String(url || ""));
+        if (isAutosave) {
+          state.pending += 1;
+          state.lastStartedAt = Date.now();
+          state.lastUrl = String(url || "");
+        }
+        const p = origFetch.apply(this, arguments);
+        if (isAutosave) {
+          const done = (status) => {
+            state.pending = Math.max(0, state.pending - 1);
+            state.lastCompletedAt = Date.now();
+            state.lastStatus = status || 0;
+          };
+          p.then((res) => done(res && res.status), () => done(0));
+        }
+        return p;
+      };
+    }
+
+    pageWindow.__mycliSmzdmAutosave = state;
+    return state;
   }
 
-  async function fetchDraftData(articleId) {
-    const payload = await requestJson(`/api/draft/${encodeURIComponent(articleId)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    if (payload?.error_code !== 0 || !payload?.data) {
-      throw new Error(payload?.error_msg || "无法读取当前草稿信息");
+  const autosave = installAutosaveWatcher();
+
+  function setNativeValue(el, value) {
+    const desc =
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value") ||
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value") ||
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+    if (desc?.set) {
+      desc.set.call(el, value);
+    } else {
+      el.value = value;
     }
-    return payload.data;
   }
 
-  async function uploadLocalImage(attachment, { articleId, token, uploadIndex }) {
+  function setTitle(title) {
+    const input = document.querySelector('textarea.article-title, textarea[placeholder="请输入文章标题"]');
+    if (!input) throw new Error("未找到标题输入框");
+    setNativeValue(input, title);
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, data: title, inputType: "insertText" }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  async function waitFor(predicate, { timeoutMs = 60000, intervalMs = 250, label = "操作" } = {}) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const value = await predicate();
+      if (value) return value;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw new Error(`${label}超时`);
+  }
+
+  // One-shot image upload. Sends multipart with `x-requested-with` so SMZDM's
+  // WAF treats it as a regular XHR rather than a bare fetch.
+  async function uploadImageOnce(attachment, articleId, fileIndex) {
     const arrayBuffer = await fetchAttachmentArrayBuffer(attachment.url);
-    const blob = new Blob([arrayBuffer], { type: attachment.mime || "application/octet-stream" });
-    const form = new FormData();
-    form.append("imgFile", blob, attachment.name || `image-${uploadIndex + 1}`);
+    const mime = attachment.mime || "application/octet-stream";
+    const blob = new pageWindow.Blob([arrayBuffer], { type: mime });
+    const form = new pageWindow.FormData();
+    form.append("imgFile", blob, attachment.name || "image");
+    form.append("id", `WU_FILE_${fileIndex}`);
+    form.append("type", mime);
     form.append("article_id", articleId);
-    form.append("id", `WU_FILE_${uploadIndex}`);
-    form.append("type", attachment.mime || "application/octet-stream");
-
-    const payload = await requestJson("/api/images/upload/local", {
+    const response = await pageWindow.fetch("/api/images/upload/local", {
       method: "POST",
-      headers: { _csrf_token: token },
+      credentials: "include",
+      headers: { "x-requested-with": "XMLHttpRequest" },
       body: form,
     });
-    if (payload?.error_code !== 0 || !payload?.data?.url) {
-      throw new Error(payload?.error_msg || `图片上传失败: ${attachment.name}`);
+    const text = await response.text();
+    if (text.trimStart().startsWith("<")) {
+      const snippet = text.slice(0, 200).replace(/\s+/g, " ");
+      const err = new Error(`图片上传被拦截 (HTTP ${response.status}, ${text.length}B): ${snippet}`);
+      err.isWaf = true;
+      throw err;
     }
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`图片上传响应不是 JSON (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    }
+    if (payload?.error_code !== 0 || !payload?.data?.url) {
+      throw new Error(payload?.error_msg || `图片上传失败 (error_code=${payload?.error_code}): ${attachment.name}`);
+    }
+    return String(payload.data.url);
+  }
+
+  async function uploadImageToSmzdm(attachment, articleId, fileIndex) {
+    const MAX_TRIES = 3;
+    let lastError;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt += 1) {
+      try {
+        return await uploadImageOnce(attachment, articleId, fileIndex);
+      } catch (error) {
+        lastError = error;
+        if (!error.isWaf || attempt === MAX_TRIES) throw error;
+        const delay = attempt * 1500;
+        logStep(`upload retry ${attempt}/${MAX_TRIES} after ${delay}ms: ${String(error.message).slice(0, 120)}`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastError;
+  }
+
+  // Splits the prepared HTML into alternating html/image segments. A top-level
+  // block whose only meaningful child is a codex-local placeholder img becomes
+  // an "image" step; everything else stays as raw html. SMZDM's image is a
+  // top-level block node, so we insert it standalone (not wrapped in <p>).
+  function planFromHtml(rawHtml) {
+    const doc = new DOMParser().parseFromString(rawHtml, "text/html");
+    const plan = [];
+    for (const node of doc.body.childNodes) {
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+      const el = /** @type {HTMLElement} */ (node);
+      const placeholder = el.querySelector('img[src^="codex-local://image/"]');
+      const match = placeholder && /^codex-local:\/\/image\/(\d+)$/.exec(placeholder.getAttribute("src") || "");
+      if (match) {
+        plan.push({ type: "image", placeholder_index: Number(match[1]) });
+        continue;
+      }
+      plan.push({ type: "html", html: el.outerHTML });
+    }
+    return plan;
+  }
+
+  function imageNode(url) {
+    // Attrs verified against editor.getJSON() output for a manually-pasted
+    // image. `issmzmd` is BOOLEAN true (not string), `src` (not `pic_url`).
     return {
-      id: payload.data.id || "",
-      url: payload.data.url,
-      pic_url: payload.data.url,
-      original: payload.data,
+      type: "image",
+      attrs: {
+        src: url,
+        platform: "fe",
+        issmzmd: true,
+        class: "",
+      },
     };
   }
 
-  function replaceImagePlaceholders(html, images, uploadedByPath) {
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    for (const imageNode of [...doc.querySelectorAll("img")]) {
-      const src = imageNode.getAttribute("src") || "";
-      const match = /^codex-local:\/\/image\/(\d+)$/.exec(src);
-      if (!match) continue;
-      const occurrence = images[Number(match[1])];
-      if (!occurrence) throw new Error(`未找到占位图片: ${src}`);
-      const uploaded = uploadedByPath.get(occurrence.local_path);
-      if (!uploaded?.url) throw new Error(`未找到上传结果: ${occurrence.local_path}`);
-      imageNode.setAttribute("src", uploaded.url);
-    }
-    return doc.body.innerHTML;
-  }
-
-  function htmlTextCount(html) {
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    return (doc.body.textContent || "").replace(/\s+/g, "").length;
-  }
-
-  function buildSubmitParams({
-    articleId,
-    title,
-    html,
-    draftData,
-    uploadedImages,
-  }) {
-    const params = new URLSearchParams();
-    const focusImage =
-      uploadedImages[0]?.url ||
-      draftData?.article_image?.pic_url ||
-      draftData?.article_image_url ||
-      "";
-
-    params.set("article_id", articleId);
-    params.set("submit_type", "manul_save");
-    params.set("ai_title", draftData?.ai_title || "");
-    params.set("title", title);
-    params.set("series_title", draftData?.series_title || "");
-    params.set("focus_image", focusImage);
-    params.set("series_order_id", String(draftData?.series_order_id || 0));
-    params.set("series_id", String(draftData?.series_id || 0));
-    params.set("anonymous", String(draftData?.anonymous || 0));
-    params.set("first_publish", String(draftData?.first_publish || 0));
-    params.set("remark", draftData?.remark || "");
-    params.set("editorValue", html);
-    params.set("create_state_type", String(draftData?.create_state_type || 0));
-    params.set("ai_state_type", String(draftData?.ai_state_type || 0));
-    params.set("topic_list", JSON.stringify(draftData?.topic_list || []));
-    params.set("tag_list", JSON.stringify(draftData?.tag_list || []));
-    params.set("square_pic_url", draftData?.square_pic_url || "");
-    params.set("cover_image_rectangle", draftData?.cover_image_rectangle || "");
-    params.set("cover_image_square", draftData?.cover_image_square || "");
-    params.set("group_id", draftData?.group_id || "");
-    params.set("wne", String(htmlTextCount(html)));
-    if (uploadedImages.length) {
-      params.set(
-        "image_list",
-        JSON.stringify(
-          uploadedImages.map((item) => ({
-            id: item.id || "",
-            pic_url: item.pic_url || item.url,
-            url: item.url,
-          })),
-        ),
-      );
-    }
-    if (draftData?.ai_outline_log_ids) {
-      params.set("ai_outline_log_ids", String(draftData.ai_outline_log_ids));
-    }
-    return params;
-  }
-
-  async function saveDraftViaApi(cmd) {
+  async function saveDraftViaEditor(cmd) {
     const title = String(cmd.args?.title || "").trim();
     const rawHtml = String(cmd.args?.html || "").trim();
     if (!title) throw new Error("标题为空，无法保存草稿");
     if (!rawHtml) throw new Error("正文为空，无法保存草稿");
-
-    const draftId = await createOrReuseDraft();
-    setStatus(`draft: ready\n${draftId}`);
-
-    const token = await fetchToken();
-    const draftData = await fetchDraftData(draftId);
+    const articleId = getArticleId();
+    if (!articleId) {
+      throw new Error(`未找到草稿页面，请先打开什么值得买投稿编辑页（当前: ${location.href}）`);
+    }
+    try {
+      await waitFor(() => !!(pageWindow.editor && pageWindow.editor.commands), {
+        timeoutMs: 8000,
+        intervalMs: 200,
+        label: "等待编辑器初始化",
+      });
+    } catch {
+      throw new Error(`当前标签页未检测到 pageWindow.editor（${location.href}）`);
+    }
 
     const attachments = Array.isArray(cmd.args?.attachments) ? cmd.args.attachments : [];
     const images = Array.isArray(cmd.args?.images) ? cmd.args.images : [];
-    const uploadedByPath = new Map();
 
-    if (images.length) {
-      const dedupedByPath = new Map();
-      for (const image of images) {
-        if (!dedupedByPath.has(image.local_path)) {
-          dedupedByPath.set(image.local_path, image);
-        }
-      }
-      const uniqueImages = [...dedupedByPath.values()];
-      for (let index = 0; index < uniqueImages.length; index += 1) {
-        const image = uniqueImages[index];
-        const attachment = attachments[image.attachment_index];
-        if (!attachment) {
-          throw new Error(`未找到图片附件: ${image.local_path}`);
-        }
-        setStatus(`draft: upload ${index + 1}/${uniqueImages.length}\n${attachment.name}`);
-        const uploaded = await uploadLocalImage(attachment, {
-          articleId: draftId,
-          token,
-          uploadIndex: index,
-        });
-        uploadedByPath.set(image.local_path, uploaded);
-      }
+    setStatus(`draft: preparing\n${articleId}`);
+    logStep(`begin: articleId=${articleId}, title=${title.slice(0, 30)}, images=${images.length}, attachments=${attachments.length}`);
+    setTitle(title);
+    logStep("title set");
+
+    // 1) Upload each unique attachment to SMZDM, collect real URLs.
+    const urlByAttachmentIndex = new Map();
+    for (let i = 0; i < attachments.length; i += 1) {
+      const att = attachments[i];
+      setStatus(`draft: upload ${i + 1}/${attachments.length}\n${att.name}`);
+      logStep(`upload ${i + 1}/${attachments.length}: ${att.name} (${att.size}B, ${att.mime})`);
+      const url = await uploadImageToSmzdm(att, articleId, i);
+      urlByAttachmentIndex.set(i, url);
+      logStep(`upload ${i + 1} ok → ${url}`);
     }
 
-    const finalHtml = images.length
-      ? replaceImagePlaceholders(rawHtml, images, uploadedByPath)
-      : rawHtml;
-    const uploadedImages = [...uploadedByPath.values()];
-    const body = buildSubmitParams({
-      articleId: draftId,
-      title,
-      html: finalHtml,
-      draftData,
-      uploadedImages,
-    });
+    // 2) Walk the plan and always append at the end of the doc. Plain
+     //    `insertContent` inserts at the current selection — after a chain of
+     //    inserts the cursor drifts in ways that make later calls clobber or
+     //    no-op. `insertContentAt(<end>, ...)` is explicit and idempotent.
+    const plan = planFromHtml(rawHtml);
+    logStep(`plan: ${plan.length} steps`);
+    pageWindow.editor.commands.clearContent();
+    for (let i = 0; i < plan.length; i += 1) {
+      const step = plan[i];
+      const endPos = pageWindow.editor.state.doc.content.size;
+      if (step.type === "html") {
+        pageWindow.editor.commands.insertContentAt(endPos, step.html);
+        continue;
+      }
+      const occurrence = images[step.placeholder_index];
+      if (!occurrence) throw new Error(`未找到占位图片: ${step.placeholder_index}`);
+      const url = urlByAttachmentIndex.get(occurrence.attachment_index);
+      if (!url) throw new Error(`未找到上传 URL: ${occurrence.local_path}`);
+      pageWindow.editor.commands.insertContentAt(endPos, imageNode(url));
+      logStep(`step ${i + 1}/${plan.length}: image @${endPos} → ${url}`);
+    }
+    logStep(`content inserted (html ${pageWindow.editor.getHTML().length} chars), waiting for autosave`);
 
     setStatus(`draft: saving\n${title.slice(0, 24)}`);
-    const payload = await requestJson("/api/editor/article/submit", {
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-        _csrf_token: token,
-      },
-      body: body.toString(),
-    });
-    if (payload?.error_code !== 0) {
-      throw new Error(payload?.error_msg || "保存草稿失败");
+    // SMZDM autosaves on a debounce (~5s after the last edit) and posts to
+    // /api/editor/article/submit. Wait for an autosave that was triggered
+    // *after* our edits finished, so we never report success on stale state.
+    const editsFinishedAt = Date.now();
+    await waitFor(
+      () =>
+        autosave.lastStartedAt >= editsFinishedAt &&
+        autosave.pending === 0 &&
+        autosave.lastCompletedAt >= autosave.lastStartedAt,
+      { timeoutMs: 30000, intervalMs: 250, label: "等待自动保存" },
+    );
+    if (autosave.lastStatus && (autosave.lastStatus < 200 || autosave.lastStatus >= 300)) {
+      throw new Error(`自动保存失败: HTTP ${autosave.lastStatus}`);
     }
 
-    setStatus(`draft: saved\n${draftId}`);
+    setStatus(`draft: saved\n${articleId}`);
     return {
-      draft_id: draftId,
-      draft_url: `https://post.smzdm.com/edit/${draftId}`,
-      content_length: finalHtml.length,
+      draft_id: articleId,
+      draft_url: `https://post.smzdm.com/edit/${articleId}`,
+      content_length: pageWindow.editor.getHTML().length,
       image_occurrence_count: Number(cmd.args?.image_occurrence_count) || images.length,
-      unique_image_count: uploadedImages.length,
-      submit_result: payload?.data || null,
+      unique_image_count: pageWindow.editor.commands.queryImageData().length,
+      autosave_status: autosave.lastStatus,
+      autosave_url: autosave.lastUrl,
+      submit_result: null,
     };
   }
 
@@ -436,12 +511,12 @@
           sendResult(msg.id, false, "正在处理上一条命令，请稍后再试");
           return;
         }
-        if (msg.action !== "draft") {
-          sendResult(msg.id, false, `Unknown action for ${SITE}: ${msg.action}`);
-          return;
-        }
-        busy = true;
-        saveDraftViaApi(msg)
+      if (msg.action !== "draft") {
+        sendResult(msg.id, false, `Unknown action for ${SITE}: ${msg.action}`);
+        return;
+      }
+      busy = true;
+        saveDraftViaEditor(msg)
           .then((result) => sendResult(msg.id, true, result))
           .catch((error) => sendResult(msg.id, false, error.message || String(error)))
           .finally(() => {
