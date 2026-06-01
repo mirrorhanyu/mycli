@@ -36,6 +36,7 @@ npm link        # so `mycli` is on your PATH
 ```sh
 mycli doubao ask --text "3+2 等于多少"
 mycli doubao ask --file ./prompts.md > result.md
+mycli doubao read --file ./file.md --out-dir ./audio
 mycli doubao podcast --file ./material.pdf --out-dir ./audio
 ```
 

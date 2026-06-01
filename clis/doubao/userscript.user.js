@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.4.1
+// @version      0.5.1
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.4.1";
+  const VERSION = "0.5.1";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -34,6 +34,8 @@
   const PODCAST_TIMEOUT_MS = 10 * 60 * 1000;
   const MIN_AUDIO_BYTES = 64 * 1024;
   const STABLE_MS = 3500;
+  const READ_AUDIO_QUIET_MS = 3000;
+  const READ_AUDIO_FALLBACK_QUIET_MS = 15000;
   // Doubao's markdown renderer is debounced: even after the "停止生成" button
   // disappears (network stream ended), tokens keep flushing into the DOM for
   // another 1–5 seconds. Require the "done" signal to be stable for this long
@@ -43,6 +45,14 @@
   let busy = false;
   let lastStatus = "";
   const capturedPodcastAudios = [];
+  const readAudioCapture = {
+    active: false,
+    chunks: [],
+    pcmChunks: [],
+    sampleRate: 24000,
+    startedAt: 0,
+    lastChunkAt: 0,
+  };
 
   let ws = null;
   let reconnectTimer = null;
@@ -211,6 +221,119 @@
       .filter((item) => item.byteLength >= MIN_AUDIO_BYTES)
       .sort((a, b) => a.createdAt - b.createdAt)
       .at(-1);
+  }
+
+  function cloneArrayBuffer(value) {
+    if (value instanceof ArrayBuffer) return value.slice(0);
+    if (ArrayBuffer.isView(value)) {
+      return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    }
+    if (value && typeof value.byteLength === "number" && typeof value.slice === "function") {
+      return value.slice(0);
+    }
+    return null;
+  }
+
+  function cloneFloat32Array(value) {
+    if (!value || typeof value.length !== "number") return null;
+    const tag = Object.prototype.toString.call(value);
+    if (tag !== "[object Float32Array]") return null;
+    return new Float32Array(value);
+  }
+
+  function readAscii(view, offset, length) {
+    if (offset + length > view.byteLength) return "";
+    let text = "";
+    for (let i = 0; i < length; i += 1) text += String.fromCharCode(view.getUint8(offset + i));
+    return text;
+  }
+
+  function looksLikeDecodableAudioBuffer(buffer) {
+    if (!buffer || buffer.byteLength < 2048) return false;
+    const view = new DataView(buffer);
+    const head4 = readAscii(view, 0, 4);
+    const head3 = readAscii(view, 0, 3);
+    return (
+      (head4 === "RIFF" && readAscii(view, 8, 4) === "WAVE") ||
+      head3 === "ID3" ||
+      head4 === "OggS" ||
+      readAscii(view, 4, 4) === "ftyp"
+    );
+  }
+
+  function resetReadAudioCapture() {
+    readAudioCapture.active = true;
+    readAudioCapture.chunks = [];
+    readAudioCapture.pcmChunks = [];
+    readAudioCapture.sampleRate = 24000;
+    readAudioCapture.startedAt = Date.now();
+    readAudioCapture.lastChunkAt = 0;
+  }
+
+  function stopReadAudioCapture() {
+    readAudioCapture.active = false;
+  }
+
+  function rememberReadAudioChunk(buffer) {
+    if (!readAudioCapture.active || !looksLikeDecodableAudioBuffer(buffer)) return;
+    readAudioCapture.chunks.push(buffer);
+    readAudioCapture.lastChunkAt = Date.now();
+    while (readAudioCapture.chunks.length > 2000) readAudioCapture.chunks.shift();
+  }
+
+  function rememberReadPcmChunk(data, sampleRate) {
+    if (!readAudioCapture.active) return;
+    const chunk = cloneFloat32Array(data);
+    if (!chunk || !chunk.length) return;
+    readAudioCapture.pcmChunks.push(chunk);
+    if (Number.isFinite(sampleRate) && sampleRate > 0) readAudioCapture.sampleRate = sampleRate;
+    readAudioCapture.lastChunkAt = Date.now();
+    while (readAudioCapture.pcmChunks.length > 2000) readAudioCapture.pcmChunks.shift();
+  }
+
+  function wrapAudioWorkletPort(node, audioContext) {
+    const port = node?.port;
+    if (!port || port.__mycliReadAudioPortWrapped || typeof port.postMessage !== "function") return;
+    port.__mycliReadAudioPortWrapped = true;
+    const nativePostMessage = port.postMessage;
+    port.postMessage = function mycliAudioWorkletPostMessage(message) {
+      try {
+        if (message?.message === "dataIn") {
+          rememberReadPcmChunk(message.data, audioContext?.sampleRate);
+        }
+      } catch {}
+      return nativePostMessage.apply(this, arguments);
+    };
+  }
+
+  function installReadAudioSniffer() {
+    const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+    for (const AudioContextCtor of [pageWindow.AudioContext, pageWindow.webkitAudioContext]) {
+      const proto = AudioContextCtor?.prototype;
+      if (!proto || proto.__mycliReadAudioSnifferInstalled || typeof proto.decodeAudioData !== "function") continue;
+      proto.__mycliReadAudioSnifferInstalled = true;
+      const nativeDecodeAudioData = proto.decodeAudioData;
+      proto.decodeAudioData = function mycliDecodeAudioData(audioData, successCallback, errorCallback) {
+        try {
+          const copy = cloneArrayBuffer(audioData);
+          if (copy) rememberReadAudioChunk(copy);
+        } catch {}
+        return nativeDecodeAudioData.apply(this, arguments);
+      };
+    }
+
+    const NativeAudioWorkletNode = pageWindow.AudioWorkletNode;
+    if (NativeAudioWorkletNode && !pageWindow.__mycliReadAudioWorkletSnifferInstalled) {
+      pageWindow.__mycliReadAudioWorkletSnifferInstalled = true;
+      const WrappedAudioWorkletNode = function MycliAudioWorkletNode(audioContext) {
+        const node = Reflect.construct(NativeAudioWorkletNode, arguments, new.target || WrappedAudioWorkletNode);
+        wrapAudioWorkletPort(node, audioContext);
+        return node;
+      };
+      Object.setPrototypeOf(WrappedAudioWorkletNode, NativeAudioWorkletNode);
+      WrappedAudioWorkletNode.prototype = NativeAudioWorkletNode.prototype;
+      pageWindow.AudioWorkletNode = WrappedAudioWorkletNode;
+    }
   }
 
   function installPodcastNetworkSniffer() {
@@ -644,6 +767,7 @@
 
     return outermost
       .map((element) => ({
+        element,
         text: meaningfulText(element.innerText || element.textContent || "", prompt),
         bottom: element.getBoundingClientRect().bottom,
         height: element.getBoundingClientRect().height,
@@ -653,11 +777,15 @@
       .sort((a, b) => a.bottom - b.bottom);
   }
 
-  function latestAnswer(prompt) {
+  function latestAnswerCandidate(prompt) {
     const candidates = collectAnswerCandidates(prompt);
     const withoutPromptEcho = candidates.filter((item) => !item.text.includes(prompt));
     const pool = withoutPromptEcho.length ? withoutPromptEcho : candidates;
-    return pool.at(-1)?.text || "";
+    return pool.at(-1) || null;
+  }
+
+  function latestAnswer(prompt) {
+    return latestAnswerCandidate(prompt)?.text || "";
   }
 
   function answerCount() {
@@ -775,6 +903,104 @@
       "audio/webm": "webm",
     };
     return map[String(contentType || "").toLowerCase()] || "";
+  }
+
+  function parseWav(buffer) {
+    const view = new DataView(buffer);
+    if (readAscii(view, 0, 4) !== "RIFF" || readAscii(view, 8, 4) !== "WAVE") return null;
+
+    let offset = 12;
+    let fmt = null;
+    let data = null;
+    while (offset + 8 <= view.byteLength) {
+      const id = readAscii(view, offset, 4);
+      const size = view.getUint32(offset + 4, true);
+      const start = offset + 8;
+      const end = Math.min(start + size, view.byteLength);
+      if (id === "fmt ") fmt = new Uint8Array(buffer.slice(start, end));
+      if (id === "data") data = new Uint8Array(buffer.slice(start, end));
+      offset = start + size + (size % 2);
+    }
+
+    return fmt && data ? { fmt, data } : null;
+  }
+
+  function writeAscii(target, offset, text) {
+    for (let i = 0; i < text.length; i += 1) target[offset + i] = text.charCodeAt(i);
+  }
+
+  function equalBytes(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
+  function wavBlobFromFloat32Chunks(chunks, sampleRate) {
+    const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    if (!totalSamples) throw new Error("No read-aloud PCM audio was captured");
+    const dataLength = totalSamples * 2;
+    const totalLength = 44 + dataLength;
+    const bytes = new Uint8Array(totalLength);
+    const view = new DataView(bytes.buffer);
+    let offset = 0;
+    writeAscii(bytes, offset, "RIFF"); offset += 4;
+    view.setUint32(offset, totalLength - 8, true); offset += 4;
+    writeAscii(bytes, offset, "WAVE"); offset += 4;
+    writeAscii(bytes, offset, "fmt "); offset += 4;
+    view.setUint32(offset, 16, true); offset += 4;
+    view.setUint16(offset, 1, true); offset += 2;
+    view.setUint16(offset, 1, true); offset += 2;
+    view.setUint32(offset, sampleRate, true); offset += 4;
+    view.setUint32(offset, sampleRate * 2, true); offset += 4;
+    view.setUint16(offset, 2, true); offset += 2;
+    view.setUint16(offset, 16, true); offset += 2;
+    writeAscii(bytes, offset, "data"); offset += 4;
+    view.setUint32(offset, dataLength, true); offset += 4;
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i += 1) {
+        const sample = Math.max(-1, Math.min(1, chunk[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        offset += 2;
+      }
+    }
+    return new Blob([bytes], { type: "audio/wav" });
+  }
+
+  function blobFromReadAudioChunks() {
+    const chunks = readAudioCapture.chunks.slice();
+    const pcmChunks = readAudioCapture.pcmChunks.slice();
+    if (!chunks.length && !pcmChunks.length) throw new Error("No read-aloud audio was captured");
+
+    if (!chunks.length && pcmChunks.length) {
+      return wavBlobFromFloat32Chunks(pcmChunks, readAudioCapture.sampleRate || 24000);
+    }
+
+    const parsed = chunks.map(parseWav);
+    if (parsed.every(Boolean) && parsed.every((item) => equalBytes(item.fmt, parsed[0].fmt))) {
+      const fmt = parsed[0].fmt;
+      const dataLength = parsed.reduce((sum, item) => sum + item.data.length, 0);
+      const totalLength = 12 + 8 + fmt.length + 8 + dataLength;
+      const bytes = new Uint8Array(totalLength);
+      const view = new DataView(bytes.buffer);
+      let offset = 0;
+      writeAscii(bytes, offset, "RIFF"); offset += 4;
+      view.setUint32(offset, totalLength - 8, true); offset += 4;
+      writeAscii(bytes, offset, "WAVE"); offset += 4;
+      writeAscii(bytes, offset, "fmt "); offset += 4;
+      view.setUint32(offset, fmt.length, true); offset += 4;
+      bytes.set(fmt, offset); offset += fmt.length;
+      writeAscii(bytes, offset, "data"); offset += 4;
+      view.setUint32(offset, dataLength, true); offset += 4;
+      for (const item of parsed) {
+        bytes.set(item.data, offset);
+        offset += item.data.length;
+      }
+      return new Blob([bytes], { type: "audio/wav" });
+    }
+
+    return new Blob(chunks, { type: "audio/wav" });
   }
 
   function safeFilename(name) {
@@ -927,6 +1153,107 @@
     throw new Error(lastAudioError ? `Timed out waiting for podcast audio: ${lastAudioError}` : "Timed out waiting for podcast download button");
   }
 
+  function collectReadAloudButtons() {
+    return clickableElements()
+      .map((element) => ({
+        element,
+        text: (buttonText(element) || shortVisibleText(element)).replace(/\s+/g, " ").trim(),
+        rect: element.getBoundingClientRect(),
+      }))
+      .filter((item) => /朗读|read aloud/i.test(item.text))
+      .filter((item) => !/自动播报|auto|暂停|停止|pause|stop/i.test(item.text));
+  }
+
+  function readAloudIsPlaying() {
+    return clickableElements().some((element) => {
+      const text = (buttonText(element) || shortVisibleText(element)).replace(/\s+/g, " ").trim();
+      return /暂停朗读|停止朗读|pause|stop/i.test(text);
+    });
+  }
+
+  function findReadAloudButton(answerItem) {
+    const buttons = collectReadAloudButtons();
+    if (!buttons.length) return null;
+    const answerRect = answerItem?.element?.getBoundingClientRect?.();
+    if (!answerRect) return buttons.sort((a, b) => a.rect.bottom - b.rect.bottom).at(-1)?.element || null;
+
+    return buttons
+      .map((item) => {
+        const belowPenalty = item.rect.top < answerRect.bottom - 80 ? 5000 : 0;
+        const vertical = Math.abs(item.rect.top - answerRect.bottom);
+        const horizontal = Math.abs(item.rect.left - answerRect.left);
+        return { ...item, score: belowPenalty + vertical + horizontal / 20 };
+      })
+      .sort((a, b) => a.score - b.score)[0]?.element || null;
+  }
+
+  async function saveReadAudio(jobId) {
+    const blob = blobFromReadAudioChunks();
+    const extension = extensionFromBlob(blob) || "wav";
+    const filename = `doubao-read-${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`;
+    setStatus(`saving read audio\n${filename}`);
+    const result = await uploadToLocalService(jobId, filename, blob);
+    return { size: blob.size, savedPath: result.path };
+  }
+
+  async function clickReadAloudAndSave(prompt, jobId, timeoutMs) {
+    installReadAudioSniffer();
+    const answerItem = latestAnswerCandidate(prompt);
+    const button = findReadAloudButton(answerItem);
+    if (!button) throw new Error("Could not find read-aloud button");
+
+    resetReadAudioCapture();
+    setStatus("starting read-aloud");
+    button.click();
+
+    const started = Date.now();
+    const totalTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : PODCAST_TIMEOUT_MS;
+    let lastChunkCount = 0;
+    let sawPlaying = false;
+    let lastDebugAt = 0;
+
+    try {
+      while (Date.now() - started < totalTimeoutMs) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        becomeWorker();
+
+        const chunkCount = readAudioCapture.chunks.length + readAudioCapture.pcmChunks.length;
+        if (chunkCount !== lastChunkCount) {
+          lastChunkCount = chunkCount;
+          setStatus(`capturing read audio\nchunks=${chunkCount}`);
+        }
+
+        const playing = readAloudIsPlaying();
+        if (playing) sawPlaying = true;
+        const quietFor = readAudioCapture.lastChunkAt ? Date.now() - readAudioCapture.lastChunkAt : 0;
+
+        if (chunkCount && sawPlaying && !playing && quietFor > 1000) {
+          const saved = await saveReadAudio(jobId);
+          return `Read audio saved: ${saved.savedPath} (${saved.size} bytes)`;
+        }
+
+        if (chunkCount && quietFor > READ_AUDIO_FALLBACK_QUIET_MS) {
+          const saved = await saveReadAudio(jobId);
+          return `Read audio saved: ${saved.savedPath} (${saved.size} bytes)`;
+        }
+
+        if (chunkCount && quietFor > READ_AUDIO_QUIET_MS && !playing) {
+          const saved = await saveReadAudio(jobId);
+          return `Read audio saved: ${saved.savedPath} (${saved.size} bytes)`;
+        }
+
+        if (Date.now() - lastDebugAt > 3000) {
+          lastDebugAt = Date.now();
+          setStatus(`waiting read audio\nchunks=${chunkCount} playing=${playing ? "yes" : "no"} quiet=${(quietFor / 1000).toFixed(1)}s`);
+        }
+      }
+    } finally {
+      stopReadAudioCapture();
+    }
+
+    throw new Error(`Timed out waiting for read-aloud audio (chunks=${readAudioCapture.chunks.length + readAudioCapture.pcmChunks.length})`);
+  }
+
   async function waitForAnswer(prompt, baselineCount, baselineAnswer, timeoutMs) {
     const started = Date.now();
     const totalTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -990,7 +1317,7 @@
   }
 
   async function runCommand(cmd) {
-    // cmd = { id, action, args: { prompt, wait_ms, output_dir?, attachments?: [{id,name,mime,size,url}] } }
+    // cmd = { id, action, args: { prompt, wait_ms, output_dir?, audio_wait_ms?, attachments?: [{id,name,mime,size,url}] } }
     setStatus(`running ${cmd.action}\n${cmd.id.slice(0, 8)}`);
     const args = cmd.args || {};
     const prompt = String(args.prompt || "");
@@ -1000,6 +1327,7 @@
     if (!input) throw new Error("Could not find Doubao input box");
 
     const isPodcast = cmd.action === "podcast";
+    const isRead = cmd.action === "read";
     const podcastDownloadBaseline = collectPodcastDownloadButtons().length;
     if (isPodcast) {
       const attachments = (args.attachments || []).map((att) => ({
@@ -1026,6 +1354,13 @@
     const answer = isPodcast
       ? await waitForPodcastDownloadButton(podcastDownloadBaseline, cmd.id)
       : await waitForAnswer(prompt, baselineCount, baselineAnswer, waitMs);
+
+    if (isRead) {
+      const audioWaitMs = Number(args.audio_wait_ms) || PODCAST_TIMEOUT_MS;
+      const message = await clickReadAloudAndSave(prompt, cmd.id, audioWaitMs);
+      setStatus(`done\n${cmd.id.slice(0, 8)}\n${message}`);
+      return message;
+    }
 
     setStatus(`done\n${cmd.id.slice(0, 8)}\nlen=${typeof answer === "string" ? answer.length : "?"}`);
     return answer;
@@ -1122,6 +1457,7 @@
   }, Math.max(1000, Math.floor(LOCK_TTL_MS / 2)));
 
   setStatus("starting");
+  installReadAudioSniffer();
   installPodcastNetworkSniffer();
   window.addEventListener("beforeunload", () => {
     releaseWorker();
