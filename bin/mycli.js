@@ -50,7 +50,7 @@ function usage() {
   console.error(lines.join("\n"));
 }
 
-async function runSiteCommand(site, command, options) {
+async function runSiteCommand(site, command, options, positional) {
   const loaded = loadSite(site);
   if (!loaded) {
     console.error(`Unknown site: ${site}`);
@@ -65,7 +65,7 @@ async function runSiteCommand(site, command, options) {
     return;
   }
   try {
-    await spec.run({ options, sendCommand, site, action: command });
+    await spec.run({ options, positional, sendCommand, site, action: command });
   } catch (error) {
     console.error(error.message || String(error));
     process.exitCode = 1;
@@ -159,8 +159,8 @@ async function main() {
     return;
   }
 
-  const { options } = parseArgs(rest);
-  return runSiteCommand(first, second, options);
+  const { options, positional } = parseArgs(rest);
+  return runSiteCommand(first, second, options, positional);
 }
 
 main().catch((error) => {
