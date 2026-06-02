@@ -111,7 +111,9 @@ function formatResult(results, days) {
       lines.push(`[${item.mid}] ${days} 天内没有更新`);
       continue;
     }
-    lines.push(`[${item.mid}] ${item.items.length} 条更新`);
+    const author = safeText(item.items[0]?.author);
+    const header = author ? `[${item.mid}] [${author}]` : `[${item.mid}]`;
+    lines.push(`${header} ${item.items.length} 条更新`);
     for (const entry of item.items) {
       lines.push(`  ${entry.createdText} ${entry.bvid} ${entry.title}`.trimEnd());
     }
