@@ -38,6 +38,7 @@ mycli doubao ask --text "3+2 等于多少"
 mycli doubao ask --file ./prompts.md > result.md
 mycli doubao read --file ./file.md --out-dir ./audio
 mycli doubao podcast --file ./material.pdf --out-dir ./audio
+mycli bilibili recent 402626075 123456789 --days 7 --limit 3
 ```
 
 ```sh
@@ -56,6 +57,14 @@ clis/
     ├── index.js           # require('./cmd1.js') etc.
     ├── cmd1.js            # defineCommand({ site:'newsite', name:'cmd1', run({...}) })
     └── userscript.user.js # connects to ws://127.0.0.1:17872/ws and registers site:'newsite'
+```
+
+### Bilibili site
+
+`mycli bilibili recent` looks up recent uploads for one or more mids inside a browser session that is already logged in to Bilibili. Open any Bilibili page first, then install the userscript:
+
+```sh
+open http://127.0.0.1:17872/userscript/bilibili/mycli.user.js
 ```
 
 Each Node-side command file:

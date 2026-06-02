@@ -42,6 +42,7 @@ function usage() {
   lines.push('  mycli doubao ask --text "3+2 等于多少"');
   lines.push("  mycli doubao read --file ./file.md --out-dir ./audio");
   lines.push("  mycli doubao podcast --file ./material.pdf");
+  lines.push("  mycli bilibili recent 402626075 123456789 --days 7 --limit 3");
   lines.push("");
   lines.push("Install the Tampermonkey userscript:");
   for (const site of sites) {
