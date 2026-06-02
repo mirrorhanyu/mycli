@@ -28,6 +28,12 @@ function parseBoolean(raw) {
   return raw === true || raw === "true" || raw === "1" || raw === 1;
 }
 
+function startOfTodayMs() {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  return now.getTime();
+}
+
 function parseMidList(options, positional) {
   const parts = [];
   if (options.mids && options.mids !== true) {
@@ -100,7 +106,7 @@ function normalizeEntry(entry) {
   };
 }
 
-function formatResult(results, days) {
+function formatResult(results, windowLabel) {
   const lines = [];
   for (const item of results) {
     if (item.error) {
@@ -108,7 +114,7 @@ function formatResult(results, days) {
       continue;
     }
     if (!item.items?.length) {
-      lines.push(`【${item.mid}】 ${days} 天内没有更新`);
+      lines.push(`【${item.mid}】 ${windowLabel}没有更新`);
       continue;
     }
     const author = safeText(item.items[0]?.author);
@@ -121,6 +127,27 @@ function formatResult(results, days) {
   return lines.join("\n");
 }
 
+function parseWindowSpec(options) {
+  const rawDays = options.days ?? options.day;
+  const isToday =
+    options.today === true ||
+    options.today === "true" ||
+    String(rawDays || "").toLowerCase() === "today";
+
+  if (isToday) {
+    return {
+      label: "今天",
+      cutoff: startOfTodayMs(),
+    };
+  }
+
+  const days = parseInteger(rawDays, "--days/--day", DEFAULT_DAYS);
+  return {
+    label: `${days} 天内`,
+    cutoff: Date.now() - days * 24 * 60 * 60 * 1000,
+  };
+}
+
 defineCommand({
   site: "bilibili",
   name: "recent",
@@ -131,7 +158,7 @@ defineCommand({
       throw new Error("Usage: mycli bilibili recent <mid> [mid...] --days <n>");
     }
 
-    const days = parseInteger(options.days, "--days", DEFAULT_DAYS);
+    const window = parseWindowSpec(options);
     const limit = parseInteger(options.limit, "--limit", DEFAULT_LIMIT);
     const pageSize = parseInteger(options["page-size"], "--page-size", DEFAULT_PAGE_SIZE);
     const webLocation = String(options["web-location"] || DEFAULT_WEB_LOCATION);
@@ -140,7 +167,7 @@ defineCommand({
     const timeoutMs = Number.isFinite(customTimeout) && customTimeout > 0
       ? customTimeout
       : Math.min(10 * 60 * 1000, 60000 + mids.length * 15000);
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const cutoff = window.cutoff;
 
     const prepare = await sendCommand({
       site: "bilibili",
@@ -216,10 +243,10 @@ defineCommand({
     }
 
     if (jsonOutput) {
-      process.stdout.write(`${JSON.stringify({ days, mids: results }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify({ days: window.label, mids: results }, null, 2)}\n`);
       return;
     }
 
-    process.stdout.write(`${formatResult(results, days)}\n`);
+    process.stdout.write(`${formatResult(results, window.label)}\n`);
   },
 });
