@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         mycli JD Bridge
 // @namespace    local.mycli.jd
-// @version      0.1.0
+// @version      0.2.6
 // @description  WebSocket bridge to the mycli micro-daemon. Extracts video URLs from JD item pages via hidden iframes.
 // @match        https://item.jd.com/*
+// @noframes
 // @grant        none
 // @downloadURL  http://127.0.0.1:17872/userscript/jd/mycli.user.js
 // @updateURL    http://127.0.0.1:17872/userscript/jd/mycli.user.js
@@ -16,7 +17,7 @@
   "use strict";
 
   const SITE = "jd";
-  const VERSION = "0.1.0";
+  const VERSION = "0.2.6";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RECONNECT_MIN_MS = 1000;
@@ -84,8 +85,10 @@
     if (!frame) {
       frame = document.createElement("iframe");
       frame.id = "mycli-jd-frame";
+      // Real (off-screen) size: a 1px iframe has no viewport, so viewport-lazy
+      // sections (e.g. the spec table) never render. Keep it fully off-screen.
       frame.style.cssText =
-        "width:1px;height:1px;position:fixed;left:-9999px;top:-9999px;border:0";
+        "width:1280px;height:4000px;position:fixed;left:-99999px;top:0;border:0";
       document.body.appendChild(frame);
     }
     return frame;
@@ -199,6 +202,52 @@
     return collectVideosFromDoc(frame.contentDocument);
   }
 
+  function extractAttrsFromDoc(doc) {
+    if (!doc) return {};
+    const attrs = {};
+    for (const item of doc.querySelectorAll(".attrs .item")) {
+      const label = (item.querySelector(".label .text")?.textContent || "").trim();
+      const valueEl = item.querySelector(".value .text");
+      const value = (valueEl?.getAttribute("title") || valueEl?.textContent || "").trim();
+      if (label && value) attrs[label] = value;
+    }
+    return attrs;
+  }
+
+  // The spec table is lazy: JD ships an empty .attrs container, and the rows
+  // (.attrs .item) only populate after the "商品详情" tab is clicked. So always
+  // click the tab (don't trust an existing empty .attrs), then wait for rows.
+  async function revealAttrs(doc, goodId) {
+    if (!doc) return;
+    if (doc.querySelectorAll(".attrs .item").length > 0) return;
+    const tab = [...doc.querySelectorAll("div")].find(
+      (el) => el.textContent.trim() === "商品详情",
+    );
+    if (!tab) {
+      logRemote(`[${goodId}] 商品详情 tab not found`);
+      return;
+    }
+    tab.click();
+    const win = doc.defaultView;
+    for (let i = 0; i < 30; i += 1) {
+      // Nudge IntersectionObserver-based lazy content into view by scrolling the
+      // iframe toward the bottom (the spec table sits near the page end).
+      try {
+        if (win) win.scrollTo(0, doc.body.scrollHeight);
+      } catch {}
+      if (doc.querySelectorAll(".attrs .item").length > 0) return;
+      await sleep(300);
+    }
+    // Diagnostics: dump the real .attrs structure so we can fix the selector.
+    const attrsEl = doc.querySelector(".attrs");
+    const dump = attrsEl
+      ? attrsEl.outerHTML.replace(/\s+/g, " ").slice(0, 900)
+      : "(none)";
+    logRemote(
+      `[${goodId}] attrs reveal failed; bodyH=${doc.body ? doc.body.scrollHeight : 0} html=${dump}`,
+    );
+  }
+
   async function collectAllVideos(frame, task) {
     const doc = frame.contentDocument;
     const found = [];
@@ -222,11 +271,17 @@
     }
 
     addVideos(collectVideosFromDoc(doc), { source: "initial" });
+    logRemote(`[${task.good_id}] initial videos=${found.length}`);
 
     const thumbs = getVideoThumbItems(doc);
+    logRemote(`[${task.good_id}] video thumbs=${thumbs.length}`);
     for (let i = 0; i < thumbs.length; i += 1) {
+      const tt = Date.now();
       await activateVideoThumb(thumbs[i]);
       const videos = await waitForNewVideos(frame, seen);
+      logRemote(
+        `[${task.good_id}] thumb-${i}: ${videos.length} visible (${Date.now() - tt}ms)`,
+      );
       const thumbPoster = normalizeUrl(
         thumbs[i].querySelector(".image")?.getAttribute("src") || "",
       );
@@ -252,10 +307,21 @@
       logRemote(`task ${i + 1}/${tasks.length}: ${task.good_id}`);
       setStatus(`提取视频 ${i + 1}/${tasks.length}\n${task.good_id}`);
 
+      const t0 = Date.now();
       try {
+        logRemote(`[${task.good_id}] loading iframe...`);
         await loadInFrame(frame, task.url);
+        logRemote(`[${task.good_id}] loaded (${Date.now() - t0}ms)`);
         await sleep(1500);
         const videos = await collectAllVideos(frame, task);
+        logRemote(
+          `[${task.good_id}] videos=${videos.length} (${Date.now() - t0}ms)`,
+        );
+        await revealAttrs(frame.contentDocument, task.good_id);
+        const attrs = extractAttrsFromDoc(frame.contentDocument);
+        logRemote(
+          `[${task.good_id}] DONE attrs=${Object.keys(attrs).length} (${Date.now() - t0}ms)`,
+        );
         const first = videos[0] || null;
         results.push({
           good_id: task.good_id,
@@ -266,9 +332,13 @@
           mainUrl: first?.mainUrl || null,
           posterUrl: first?.posterUrl || null,
           videoDuration: first?.videoDuration ?? null,
+          attrs,
           error: null,
         });
       } catch (error) {
+        logRemote(
+          `[${task.good_id}] ERROR (${Date.now() - t0}ms): ${error.message || error}`,
+        );
         results.push({
           good_id: task.good_id,
           url: task.url,
@@ -278,6 +348,7 @@
           mainUrl: null,
           posterUrl: null,
           videoDuration: null,
+          attrs: {},
           error: String(error.message || error),
         });
       }

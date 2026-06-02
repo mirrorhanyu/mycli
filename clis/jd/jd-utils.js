@@ -125,6 +125,26 @@ function extractMobileWareImageUrls(html) {
   return [];
 }
 
+function extractTitle(html) {
+  const match = html.match(/<title>([\s\S]*?)<\/title>/i);
+  if (!match) return null;
+  let title = match[1]
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+  // Order matters: JD's real tail is "...【行情 报价 价格 评测】-京东", so drop
+  // the "-京东" site suffix first, then the SEO bracket it exposes.
+  title = title.replace(/[\s\-—|]*京东(商城)?\s*$/, "");
+  // SEO bracket like "【行情 报价 价格 评测】" — strip a trailing bracket group
+  // when it contains those keywords, but keep genuine marketing brackets.
+  title = title.replace(
+    /[【\[][^】\]]*(行情|报价|价格|评测|图片|参数|怎么样|多少钱|品牌)[^】\]]*[】\]]\s*$/,
+    "",
+  );
+  title = title.replace(/[\s\-—|]+$/, "").trim();
+  return title || null;
+}
+
 function extractMainVideoId(html) {
   const patterns = [
     /imageAndVideoJson\s*:\s*\{\s*"mainVideoId"\s*:\s*"([^"]+)"/,
@@ -191,6 +211,24 @@ function buildVideoFilename(video, index, total, fallbackStem) {
 function randomDelay(minMs, maxMs) {
   const ms = minMs + Math.random() * (maxMs - minMs);
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Run async `fn` over `items` with at most `limit` calls in flight at once.
+// Results preserve input order. Used for CDN image downloads, which are safe to
+// parallelize (static CDN, no anti-bot throttling like the item pages have).
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  const size = Math.max(1, Math.min(limit, items.length));
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const i = cursor;
+      cursor += 1;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: size }, () => worker()));
+  return results;
 }
 
 // --- Media identity + resource.json bookkeeping ---
@@ -265,28 +303,32 @@ function recordedFilesExist(itemDir, files) {
 }
 
 async function fetchImageUrls(url, goodId) {
+  // Title comes from the desktop page; keep it even if we fall through to an
+  // image-only fallback source below.
+  let title = null;
   try {
     const { body } = await httpGetText(url);
+    title = extractTitle(body);
     const urls = extractImageUrlsFromDesktopHtml(body);
     const mainVideoId = extractMainVideoId(body);
-    if (urls.length) return { urls, source: "desktop_html", mainVideoId };
+    if (urls.length) return { urls, source: "desktop_html", mainVideoId, title };
   } catch {}
 
   await randomDelay(500, 1000);
   try {
     const { body } = await httpGetText(`https://item.jd.com/bigimage.aspx?id=${goodId}`);
     const urls = extractBigimageUrls(body);
-    if (urls.length) return { urls, source: "bigimage", mainVideoId: null };
+    if (urls.length) return { urls, source: "bigimage", mainVideoId: null, title };
   } catch {}
 
   await randomDelay(500, 1000);
   try {
     const { body } = await httpGetText(`https://item.m.jd.com/ware/view.action?wareId=${goodId}`);
     const urls = extractMobileWareImageUrls(body);
-    if (urls.length) return { urls, source: "mobile_ware", mainVideoId: null };
+    if (urls.length) return { urls, source: "mobile_ware", mainVideoId: null, title };
   } catch {}
 
-  return { urls: [], source: null, mainVideoId: null };
+  return { urls: [], source: null, mainVideoId: null, title };
 }
 
 module.exports = {
@@ -297,9 +339,11 @@ module.exports = {
   normalizeMediaUrl,
   normalizeImageUrl,
   upgradeJfsImageUrl,
+  extractTitle,
   fetchImageUrls,
   downloadFile,
   randomDelay,
+  mapWithConcurrency,
   buildImageFilename,
   buildVideoFilename,
   mediaKeyFromUrl,
