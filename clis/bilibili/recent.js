@@ -104,15 +104,15 @@ function formatResult(results, days) {
   const lines = [];
   for (const item of results) {
     if (item.error) {
-      lines.push(`[${item.mid}] 失败: ${item.error}`);
+      lines.push(`【${item.mid}】 失败: ${item.error}`);
       continue;
     }
     if (!item.items?.length) {
-      lines.push(`[${item.mid}] ${days} 天内没有更新`);
+      lines.push(`【${item.mid}】 ${days} 天内没有更新`);
       continue;
     }
     const author = safeText(item.items[0]?.author);
-    const header = author ? `[${item.mid}] [${author}]` : `[${item.mid}]`;
+    const header = author ? `【${author}】 【${item.mid}】` : `【${item.mid}】`;
     lines.push(`${header} ${item.items.length} 条更新`);
     for (const entry of item.items) {
       lines.push(`  ${entry.createdText} ${entry.bvid} ${entry.title}`.trimEnd());
