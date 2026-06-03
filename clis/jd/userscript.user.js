@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli JD Bridge
 // @namespace    local.mycli.jd
-// @version      0.2.6
+// @version      0.2.9
 // @description  WebSocket bridge to the mycli micro-daemon. Extracts video URLs from JD item pages via hidden iframes.
 // @match        https://item.jd.com/*
 // @noframes
@@ -17,7 +17,7 @@
   "use strict";
 
   const SITE = "jd";
-  const VERSION = "0.2.6";
+  const VERSION = "0.2.9";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RECONNECT_MIN_MS = 1000;
@@ -29,7 +29,37 @@
   let reconnectTimer = null;
   let reconnectDelay = RECONNECT_MIN_MS;
 
-  // --- Status overlay ---
+  // --- Status overlay (auto-tucks to the edge after 3s; click to toggle) ---
+
+  const STATUS_COLLAPSE_MS = 3000;
+  let statusCollapsed = false;
+  let statusCollapseTimer = null;
+
+  function renderStatus() {
+    const box = document.getElementById("mycli-jd-status");
+    if (!box) return;
+    if (statusCollapsed) {
+      box.textContent = "≡";
+      box.style.transform = "translateX(14px)"; // hug the right edge
+      box.style.opacity = "0.6";
+    } else {
+      box.textContent = box.dataset.full || "";
+      box.style.transform = "none";
+      box.style.opacity = "1";
+    }
+  }
+
+  function collapseStatus() {
+    statusCollapsed = true;
+    renderStatus();
+  }
+
+  function expandStatus() {
+    statusCollapsed = false;
+    renderStatus();
+    clearTimeout(statusCollapseTimer);
+    statusCollapseTimer = setTimeout(collapseStatus, STATUS_COLLAPSE_MS);
+  }
 
   function setStatus(text) {
     lastStatus = text;
@@ -50,10 +80,19 @@
         "box-shadow:0 8px 24px rgba(0,0,0,.18)",
         "max-width:280px",
         "white-space:pre-wrap",
+        "cursor:pointer",
+        "user-select:none",
+        "transition:opacity .2s ease, transform .2s ease",
       ].join(";");
+      box.addEventListener("click", () => {
+        if (statusCollapsed) expandStatus();
+        else collapseStatus();
+      });
       (document.body || document.documentElement).appendChild(box);
     }
-    box.textContent = `mycli/${SITE} ${VERSION}\n${text}`;
+    box.dataset.full = `mycli/${SITE} ${VERSION}\n${text}`;
+    // Any status change re-expands briefly, then auto-collapses after 3s.
+    expandStatus();
   }
 
   // --- WebSocket helpers ---
@@ -214,38 +253,50 @@
     return attrs;
   }
 
-  // The spec table is lazy: JD ships an empty .attrs container, and the rows
-  // (.attrs .item) only populate after the "商品详情" tab is clicked. So always
-  // click the tab (don't trust an existing empty .attrs), then wait for rows.
-  async function revealAttrs(doc, goodId) {
+  // The spec table (.attrs) is an empty placeholder until two things happen:
+  // (1) the "商品详情" tab is clicked, and (2) the section scrolls into a
+  // *painted* viewport (JD lazy-loads it via IntersectionObserver). An
+  // off-screen iframe is never painted, so its IO never fires. So we briefly
+  // bring the frame on-screen but fully transparent + click-through, scroll the
+  // spec section into the iframe's own viewport, wait for rows, then hide again.
+  async function revealAttrs(frame, goodId) {
+    const doc = frame.contentDocument;
     if (!doc) return;
     if (doc.querySelectorAll(".attrs .item").length > 0) return;
-    const tab = [...doc.querySelectorAll("div")].find(
-      (el) => el.textContent.trim() === "商品详情",
-    );
+    const tab =
+      doc.querySelector("#SPXQ-tab-column") ||
+      [...doc.querySelectorAll("div")].find(
+        (el) => el.textContent.trim() === "商品详情",
+      );
     if (!tab) {
       logRemote(`[${goodId}] 商品详情 tab not found`);
       return;
     }
-    tab.click();
-    const win = doc.defaultView;
-    for (let i = 0; i < 30; i += 1) {
-      // Nudge IntersectionObserver-based lazy content into view by scrolling the
-      // iframe toward the bottom (the spec table sits near the page end).
-      try {
-        if (win) win.scrollTo(0, doc.body.scrollHeight);
-      } catch {}
-      if (doc.querySelectorAll(".attrs .item").length > 0) return;
-      await sleep(300);
+
+    const savedStyle = frame.style.cssText;
+    frame.style.cssText =
+      `position:fixed;left:0;top:0;width:1100px;height:${window.innerHeight}px;` +
+      "opacity:0;pointer-events:none;border:0;z-index:2147483646";
+    try {
+      tab.click();
+      const win = doc.defaultView;
+      for (let i = 0; i < 30; i += 1) {
+        const attrsEl = doc.querySelector(".attrs");
+        try {
+          if (attrsEl) attrsEl.scrollIntoView({ block: "center" });
+          else if (win) win.scrollTo(0, doc.body.scrollHeight);
+        } catch {}
+        if (doc.querySelectorAll(".attrs .item").length > 0) return;
+        await sleep(300);
+      }
+      const attrsEl = doc.querySelector(".attrs");
+      const dump = attrsEl
+        ? attrsEl.outerHTML.replace(/\s+/g, " ").slice(0, 600)
+        : "(none)";
+      logRemote(`[${goodId}] attrs reveal failed; html=${dump}`);
+    } finally {
+      frame.style.cssText = savedStyle;
     }
-    // Diagnostics: dump the real .attrs structure so we can fix the selector.
-    const attrsEl = doc.querySelector(".attrs");
-    const dump = attrsEl
-      ? attrsEl.outerHTML.replace(/\s+/g, " ").slice(0, 900)
-      : "(none)";
-    logRemote(
-      `[${goodId}] attrs reveal failed; bodyH=${doc.body ? doc.body.scrollHeight : 0} html=${dump}`,
-    );
   }
 
   async function collectAllVideos(frame, task) {
@@ -317,7 +368,7 @@
         logRemote(
           `[${task.good_id}] videos=${videos.length} (${Date.now() - t0}ms)`,
         );
-        await revealAttrs(frame.contentDocument, task.good_id);
+        await revealAttrs(frame, task.good_id);
         const attrs = extractAttrsFromDoc(frame.contentDocument);
         logRemote(
           `[${task.good_id}] DONE attrs=${Object.keys(attrs).length} (${Date.now() - t0}ms)`,
@@ -352,11 +403,8 @@
           error: String(error.message || error),
         });
       }
-
-      if (i + 1 < tasks.length) {
-        await clearFrame(frame);
-        await sleep(5000 + Math.floor(Math.random() * 1001));
-      }
+      // The CLI sends one product per command and enforces its own gap between
+      // browser calls (--browser-gap), so there is no in-script inter-task wait.
     }
 
     await clearFrame(frame);

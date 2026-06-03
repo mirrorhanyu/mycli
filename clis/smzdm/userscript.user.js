@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli SMZDM Bridge
 // @namespace    local.mycli.smzdm
-// @version      0.3.4
+// @version      0.3.5
 // @description  WebSocket bridge to the mycli micro-daemon. Syncs the current SMZDM session and saves drafts through browser-side APIs.
 // @match        https://post.smzdm.com/post/*
 // @match        https://post.smzdm.com/edit/*
@@ -18,7 +18,7 @@
   "use strict";
 
   const SITE = "smzdm";
-  const VERSION = "0.3.4";
+  const VERSION = "0.3.5";
   const AUTOSAVE_URL_RE = /\/api\/editor\/article\/(submit|save)|\/api\/draft\//;
   // Tampermonkey sandboxes the script when any GM_* grant is declared. Page
   // globals like `editor` live on the real page window, accessible via
@@ -43,6 +43,36 @@
   let lastSessionSignature = "";
   let lastSyncAt = 0;
 
+  // --- Status overlay (auto-tucks to the edge after 3s; click to toggle) ---
+  const STATUS_COLLAPSE_MS = 3000;
+  let statusCollapsed = false;
+  let statusCollapseTimer = null;
+  let statusBox = null;
+
+  function renderStatus() {
+    if (!statusBox) return;
+    if (statusCollapsed) {
+      statusBox.textContent = "\u2261"; // collapsed handle: ≡
+      statusBox.style.transform = "translateX(14px)";
+      statusBox.style.opacity = "0.6";
+    } else {
+      statusBox.textContent = statusBox.dataset.full || "";
+      statusBox.style.transform = "none";
+      statusBox.style.opacity = "1";
+    }
+  }
+
+  function collapseStatus() {
+    statusCollapsed = true;
+    renderStatus();
+  }
+
+  function expandStatus() {
+    statusCollapsed = false;
+    renderStatus();
+    clearTimeout(statusCollapseTimer);
+    statusCollapseTimer = setTimeout(collapseStatus, STATUS_COLLAPSE_MS);
+  }
   function setStatus(text) {
     lastStatus = text;
     let box = document.getElementById("mycli-smzdm-status");
@@ -62,6 +92,9 @@
         "box-shadow:0 8px 24px rgba(0,0,0,.18)",
         "max-width:280px",
         "white-space:pre-wrap",
+        "cursor:pointer",
+        "user-select:none",
+        "transition:opacity .2s ease, transform .2s ease",
       ].join(";");
       const mount = document.body || document.documentElement || document.head;
       if (mount) {
@@ -78,7 +111,13 @@
         requestAnimationFrame(mountLater);
       }
     }
-    box.textContent = `mycli/${SITE} ${VERSION}\n${text}`;
+    statusBox = box;
+    box.onclick = () => {
+      if (statusCollapsed) expandStatus();
+      else collapseStatus();
+    };
+    box.dataset.full = `mycli/${SITE} ${VERSION}\n${text}`;
+    expandStatus();
   }
 
   function lockSnapshot() {

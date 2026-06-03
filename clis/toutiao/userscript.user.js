@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Toutiao Bridge
 // @namespace    local.mycli.toutiao
-// @version      0.4.1
+// @version      0.4.2
 // @description  WebSocket bridge to the mycli micro-daemon. Drives mp.toutiao.com on behalf of the CLI.
 // @match        https://mp.toutiao.com/*
 // @downloadURL  http://127.0.0.1:17872/userscript/toutiao/mycli.user.js
@@ -20,7 +20,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "toutiao";
-  const VERSION = "0.4.1";
+  const VERSION = "0.4.2";
   const UPLOAD_SOURCE = 20020002;
   const PUBLISH_ENV_TIMEOUT_MS = 15000;
   const PUBLISH_ENV_INTERVAL_MS = 250;
@@ -36,6 +36,36 @@
   let reconnectDelay = RECONNECT_MIN_MS;
 
   // ── Status box ───────────────────────────────────────────────────────────
+  // --- Status overlay (auto-tucks to the edge after 3s; click to toggle) ---
+  const STATUS_COLLAPSE_MS = 3000;
+  let statusCollapsed = false;
+  let statusCollapseTimer = null;
+  let statusBox = null;
+
+  function renderStatus() {
+    if (!statusBox) return;
+    if (statusCollapsed) {
+      statusBox.textContent = "\u2261"; // collapsed handle: ≡
+      statusBox.style.transform = "translateX(14px)";
+      statusBox.style.opacity = "0.6";
+    } else {
+      statusBox.textContent = statusBox.dataset.full || "";
+      statusBox.style.transform = "none";
+      statusBox.style.opacity = "1";
+    }
+  }
+
+  function collapseStatus() {
+    statusCollapsed = true;
+    renderStatus();
+  }
+
+  function expandStatus() {
+    statusCollapsed = false;
+    renderStatus();
+    clearTimeout(statusCollapseTimer);
+    statusCollapseTimer = setTimeout(collapseStatus, STATUS_COLLAPSE_MS);
+  }
   function setStatus(text) {
     lastStatus = text;
     let box = document.getElementById("mycli-toutiao-status");
@@ -55,10 +85,19 @@
         "box-shadow:0 8px 24px rgba(0,0,0,.18)",
         "max-width:260px",
         "white-space:pre-wrap",
+        "cursor:pointer",
+        "user-select:none",
+        "transition:opacity .2s ease, transform .2s ease",
       ].join(";");
       document.documentElement.appendChild(box);
     }
-    box.textContent = `mycli/${SITE} ${VERSION}\n${text}`;
+    statusBox = box;
+    box.onclick = () => {
+      if (statusCollapsed) expandStatus();
+      else collapseStatus();
+    };
+    box.dataset.full = `mycli/${SITE} ${VERSION}\n${text}`;
+    expandStatus();
   }
 
   // ── Worker lock (only one tab does the work) ─────────────────────────────

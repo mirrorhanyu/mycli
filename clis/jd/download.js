@@ -26,7 +26,7 @@ const IMAGE_CONCURRENCY = 6;
 // Minimum gap between two *browser* navigations (the cookie-bearing, risk-control
 // -tracked requests). The CLI's anonymous HTML/CDN work in between counts toward
 // this, so we rarely sleep the full amount.
-const MIN_BROWSER_GAP_MS = 10_000;
+const DEFAULT_BROWSER_GAP_MS = 15_000;
 
 // Download one product's images from the CDN in parallel, then record them.
 // Expects product.imageUrls / product.imageSource from the page-fetch phase.
@@ -238,13 +238,19 @@ defineCommand({
     const urls = positional.filter((u) => u.includes("jd.com"));
     if (!urls.length) {
       throw new Error(
-        "Usage: mycli jd download <url> [url2 ...] [--out-dir <dir>] [--all-videos] [--force]",
+        "Usage: mycli jd download <url> [url2 ...] [--out-dir <dir>] [--all-videos] [--force] [--browser-gap <seconds>]",
       );
     }
 
     const outDir = path.resolve(String(options["out-dir"] || "."));
     const allVideos = Boolean(options["all-videos"]);
     const force = Boolean(options.force);
+    // Minimum spacing between risk-control-tracked browser navigations, in
+    // seconds (--browser-gap). HTML/image/video CLI work counts toward it.
+    const browserGapMs = (() => {
+      const v = Number(options["browser-gap"]);
+      return Number.isFinite(v) && v >= 0 ? v * 1000 : DEFAULT_BROWSER_GAP_MS;
+    })();
 
     const products = [];
     for (const rawUrl of urls) {
@@ -275,7 +281,7 @@ defineCommand({
     // Process products one at a time: read page → download images → (if needed)
     // browser-extract video → download video. The CLI work between two browser
     // navigations (HTML fetch, image download, video download) is "free" gap
-    // time toward MIN_BROWSER_GAP_MS, so spacing out the risk-control-tracked
+    // time toward browserGapMs, so spacing out the risk-control-tracked
     // browser calls costs almost no extra wall-clock time.
     let lastBrowserAt = 0;
     let browserUnavailable = false;
@@ -321,7 +327,7 @@ defineCommand({
       // 4. Enforce the minimum gap between browser navigations. Time already
       //    spent on this product's HTML + images counts toward it.
       if (lastBrowserAt) {
-        const waitMs = MIN_BROWSER_GAP_MS - (Date.now() - lastBrowserAt);
+        const waitMs = browserGapMs - (Date.now() - lastBrowserAt);
         if (waitMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, waitMs));
         }

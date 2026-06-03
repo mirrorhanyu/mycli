@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Bilibili Bridge
 // @namespace    local.mycli.bilibili
-// @version      0.1.0
+// @version      0.1.1
 // @description  WebSocket bridge to the mycli micro-daemon for Bilibili recent-upload lookups.
 // @match        https://*.bilibili.com/*
 // @match        https://bilibili.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "bilibili";
-  const VERSION = "0.1.0";
+  const VERSION = "0.1.1";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-bilibili-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -38,6 +38,36 @@
   let reconnectDelay = RECONNECT_MIN_MS;
   let lastStatus = "";
 
+  // --- Status overlay (auto-tucks to the edge after 3s; click to toggle) ---
+  const STATUS_COLLAPSE_MS = 3000;
+  let statusCollapsed = false;
+  let statusCollapseTimer = null;
+  let statusBox = null;
+
+  function renderStatus() {
+    if (!statusBox) return;
+    if (statusCollapsed) {
+      statusBox.textContent = "\u2261"; // collapsed handle: ≡
+      statusBox.style.transform = "translateX(14px)";
+      statusBox.style.opacity = "0.6";
+    } else {
+      statusBox.textContent = statusBox.dataset.full || "";
+      statusBox.style.transform = "none";
+      statusBox.style.opacity = "1";
+    }
+  }
+
+  function collapseStatus() {
+    statusCollapsed = true;
+    renderStatus();
+  }
+
+  function expandStatus() {
+    statusCollapsed = false;
+    renderStatus();
+    clearTimeout(statusCollapseTimer);
+    statusCollapseTimer = setTimeout(collapseStatus, STATUS_COLLAPSE_MS);
+  }
   function setStatus(text) {
     lastStatus = text;
     let box = document.getElementById("mycli-bilibili-status");
@@ -57,10 +87,19 @@
         "box-shadow:0 8px 24px rgba(0,0,0,.18)",
         "max-width:280px",
         "white-space:pre-wrap",
+        "cursor:pointer",
+        "user-select:none",
+        "transition:opacity .2s ease, transform .2s ease",
       ].join(";");
       document.documentElement.appendChild(box);
     }
-    box.textContent = `mycli/${SITE} ${VERSION}\n${text}`;
+    statusBox = box;
+    box.onclick = () => {
+      if (statusCollapsed) expandStatus();
+      else collapseStatus();
+    };
+    box.dataset.full = `mycli/${SITE} ${VERSION}\n${text}`;
+    expandStatus();
   }
 
   function sendWs(message) {
