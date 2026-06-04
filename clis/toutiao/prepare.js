@@ -41,7 +41,28 @@ function resolveImagePath(markdownPath, rawPath) {
   if (cleaned.startsWith("/")) {
     return path.resolve(cleaned);
   }
-  return path.resolve(path.dirname(markdownPath), cleaned);
+
+  const markdownRelative = path.resolve(path.dirname(markdownPath), cleaned);
+  if (fs.existsSync(markdownRelative)) {
+    return markdownRelative;
+  }
+
+  // Some repository Markdown files use paths relative to the repository root
+  // even when the Markdown itself lives several directories below it.
+  let ancestor = path.dirname(path.dirname(markdownPath));
+  while (true) {
+    const candidate = path.resolve(ancestor, cleaned);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) {
+      break;
+    }
+    ancestor = parent;
+  }
+
+  return markdownRelative;
 }
 
 function extractLocalImages(markdownPath, content) {
