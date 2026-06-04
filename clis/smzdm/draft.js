@@ -25,6 +25,7 @@ defineCommand({
     }
 
     const payload = prepareDraftPayload(markdownPath);
+    const checkPreserveCards = options["check-preserve-cards"] === true;
 
     const uniquePaths = [...new Map(payload.images.map((img) => [img.local_path, img])).keys()];
     const attachments = uniquePaths.map((absPath) => {
@@ -67,14 +68,16 @@ defineCommand({
 
     const result = await sendCommand({
       site,
-      action: "draft",
+      action: checkPreserveCards ? "check-preserve-cards" : "draft",
       args: {
         title: payload.title,
         html: payload.html,
         images: imagesForUserscript,
         image_occurrence_count: payload.image_occurrence_count,
         unique_image_count: payload.unique_image_count,
-        attachments,
+        preserve_cards: options["preserve-cards"] === true || checkPreserveCards,
+        check_preserve_cards: checkPreserveCards,
+        attachments: checkPreserveCards ? [] : attachments,
         wait_ms: waitMs,
       },
       timeoutMs: waitMs + 10000,
@@ -90,6 +93,12 @@ defineCommand({
     lines.push(`标题: ${payload.title}`);
     lines.push(`图片出现次数: ${payload.image_occurrence_count}`);
     lines.push(`唯一图片数: ${result?.unique_image_count ?? payload.unique_image_count}`);
+    if (result?.existing_card_count !== undefined) {
+      lines.push(`当前商品卡片: ${result.existing_card_count}`);
+    }
+    if (result?.preserved_card_count) {
+      lines.push(`保留商品卡片: ${result.preserved_card_count}`);
+    }
     if (result?.draft_id) {
       lines.push(`draft_id: ${result.draft_id}`);
     }

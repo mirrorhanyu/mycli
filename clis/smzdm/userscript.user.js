@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli SMZDM Bridge
 // @namespace    local.mycli.smzdm
-// @version      0.3.5
+// @version      0.3.9
 // @description  WebSocket bridge to the mycli micro-daemon. Syncs the current SMZDM session and saves drafts through browser-side APIs.
 // @match        https://post.smzdm.com/post/*
 // @match        https://post.smzdm.com/edit/*
@@ -18,7 +18,7 @@
   "use strict";
 
   const SITE = "smzdm";
-  const VERSION = "0.3.5";
+  const VERSION = "0.3.9";
   const AUTOSAVE_URL_RE = /\/api\/editor\/article\/(submit|save)|\/api\/draft\//;
   // Tampermonkey sandboxes the script when any GM_* grant is declared. Page
   // globals like `editor` live on the real page window, accessible via
@@ -410,6 +410,18 @@
     };
   }
 
+  function containsGoodsCardNode(node) {
+    const attrs = node && typeof node === "object" ? node.attrs : null;
+    if (
+      attrs &&
+      typeof attrs === "object" &&
+      (attrs.b2c_url || attrs.tracking_card_url)
+    ) {
+      return true;
+    }
+    return Array.isArray(node?.content) && node.content.some(containsGoodsCardNode);
+  }
+
   async function saveDraftViaEditor(cmd) {
     const title = String(cmd.args?.title || "").trim();
     const rawHtml = String(cmd.args?.html || "").trim();
@@ -431,9 +443,29 @@
 
     const attachments = Array.isArray(cmd.args?.attachments) ? cmd.args.attachments : [];
     const images = Array.isArray(cmd.args?.images) ? cmd.args.images : [];
+    const preserveCards = cmd.args?.preserve_cards === true;
+    const checkPreserveCards = cmd.args?.check_preserve_cards === true;
+    const existingCards = preserveCards
+      ? (pageWindow.editor.getJSON()?.content || []).filter(containsGoodsCardNode)
+      : [];
+
+    if (preserveCards && existingCards.length !== images.length) {
+      throw new Error(
+        `无法安全保留商品卡片：当前 ${existingCards.length} 个，Markdown 图片 ${images.length} 张`,
+      );
+    }
+    if (checkPreserveCards) {
+      return {
+        draft_id: articleId,
+        draft_url: `https://post.smzdm.com/edit/${articleId}`,
+        image_occurrence_count: images.length,
+        existing_card_count: existingCards.length,
+        preserve_cards_compatible: true,
+      };
+    }
 
     setStatus(`draft: preparing\n${articleId}`);
-    logStep(`begin: articleId=${articleId}, title=${title.slice(0, 30)}, images=${images.length}, attachments=${attachments.length}`);
+    logStep(`begin: articleId=${articleId}, title=${title.slice(0, 30)}, images=${images.length}, attachments=${attachments.length}, preserveCards=${existingCards.length}`);
     setTitle(title);
     logStep("title set");
 
@@ -468,6 +500,11 @@
       if (!url) throw new Error(`未找到上传 URL: ${occurrence.local_path}`);
       pageWindow.editor.commands.insertContentAt(endPos, imageNode(url));
       logStep(`step ${i + 1}/${plan.length}: image @${endPos} → ${url}`);
+      if (preserveCards) {
+        const cardEndPos = pageWindow.editor.state.doc.content.size;
+        pageWindow.editor.commands.insertContentAt(cardEndPos, existingCards[step.placeholder_index]);
+        logStep(`step ${i + 1}/${plan.length}: preserved card @${cardEndPos}`);
+      }
     }
     logStep(`content inserted (html ${pageWindow.editor.getHTML().length} chars), waiting for autosave`);
 
@@ -494,6 +531,7 @@
       content_length: pageWindow.editor.getHTML().length,
       image_occurrence_count: Number(cmd.args?.image_occurrence_count) || images.length,
       unique_image_count: pageWindow.editor.commands.queryImageData().length,
+      preserved_card_count: existingCards.length,
       autosave_status: autosave.lastStatus,
       autosave_url: autosave.lastUrl,
       submit_result: null,
@@ -550,7 +588,7 @@
           sendResult(msg.id, false, "正在处理上一条命令，请稍后再试");
           return;
         }
-      if (msg.action !== "draft") {
+      if (msg.action !== "draft" && msg.action !== "check-preserve-cards") {
         sendResult(msg.id, false, `Unknown action for ${SITE}: ${msg.action}`);
         return;
       }
