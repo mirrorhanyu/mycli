@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const http = require("node:http");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
@@ -107,21 +108,43 @@ async function shutdownDaemon() {
   return { wasRunning: true };
 }
 
+function postJson(url, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        let json;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          reject(new Error(`Daemon returned non-JSON (HTTP ${res.statusCode})`));
+          return;
+        }
+        const status = res.statusCode || 0;
+        resolve({ status, ok: status >= 200 && status < 300, json });
+      });
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
 async function sendCommand({ site, action, args = {}, timeoutMs }) {
   await ensureDaemon();
-  const body = JSON.stringify({ site, action, args, timeout_ms: timeoutMs });
-  // CLI-side fetch has no hard timeout — daemon enforces it and returns 502 on timeout.
-  const res = await fetch(`${API}/command`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body,
-  });
-  let payload;
-  try {
-    payload = await res.json();
-  } catch {
-    throw new Error(`Daemon returned non-JSON (HTTP ${res.status})`);
-  }
+  // Native fetch has a response-headers timeout that is shorter than long
+  // browser jobs. Keep this request open and let the daemon enforce timeoutMs.
+  const res = await postJson(`${API}/command`, { site, action, args, timeout_ms: timeoutMs });
+  const payload = res.json;
   if (!res.ok || payload.ok === false) {
     throw new Error(payload.error || `HTTP ${res.status}`);
   }

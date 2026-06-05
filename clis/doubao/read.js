@@ -3,7 +3,7 @@ const path = require("node:path");
 const { defineCommand } = require("../../src/registry.js");
 
 const DEFAULT_WAIT_MS = 300000;
-const DEFAULT_AUDIO_WAIT_MS = 10 * 60 * 1000;
+const DEFAULT_AUDIO_WAIT_MS = 30 * 60 * 1000;
 const READ_PREFIX = "我需要你完整的一字不差的把下面的文字返回给我，其余的任何信息我都不要了。";
 
 function textFromOptions(options) {

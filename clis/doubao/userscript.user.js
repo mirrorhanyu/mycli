@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.5.2
+// @version      0.5.5
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.5.2";
+  const VERSION = "0.5.5";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -33,6 +33,8 @@
   const ANSWER_TIMEOUT_MS = 120000;
   const PODCAST_TIMEOUT_MS = 10 * 60 * 1000;
   const MIN_AUDIO_BYTES = 64 * 1024;
+  const MAX_READ_CAPTURE_BYTES = 400 * 1024 * 1024;
+  const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
   const STABLE_MS = 3500;
   const READ_AUDIO_QUIET_MS = 3000;
   const READ_AUDIO_FALLBACK_QUIET_MS = 15000;
@@ -52,6 +54,9 @@
     sampleRate: 24000,
     startedAt: 0,
     lastChunkAt: 0,
+    encodedBytes: 0,
+    pcmBytes: 0,
+    error: "",
   };
 
   let ws = null;
@@ -307,6 +312,9 @@
     readAudioCapture.sampleRate = 24000;
     readAudioCapture.startedAt = Date.now();
     readAudioCapture.lastChunkAt = 0;
+    readAudioCapture.encodedBytes = 0;
+    readAudioCapture.pcmBytes = 0;
+    readAudioCapture.error = "";
   }
 
   function stopReadAudioCapture() {
@@ -315,19 +323,29 @@
 
   function rememberReadAudioChunk(buffer) {
     if (!readAudioCapture.active || !looksLikeDecodableAudioBuffer(buffer)) return;
+    if (readAudioCapture.encodedBytes + buffer.byteLength > MAX_READ_CAPTURE_BYTES) {
+      readAudioCapture.error = "Read-aloud encoded audio exceeded capture limit";
+      readAudioCapture.active = false;
+      return;
+    }
     readAudioCapture.chunks.push(buffer);
+    readAudioCapture.encodedBytes += buffer.byteLength;
     readAudioCapture.lastChunkAt = Date.now();
-    while (readAudioCapture.chunks.length > 2000) readAudioCapture.chunks.shift();
   }
 
   function rememberReadPcmChunk(data, sampleRate) {
     if (!readAudioCapture.active) return;
     const chunk = cloneFloat32Array(data);
     if (!chunk || !chunk.length) return;
+    if (readAudioCapture.pcmBytes + chunk.byteLength > MAX_READ_CAPTURE_BYTES) {
+      readAudioCapture.error = "Read-aloud PCM audio exceeded capture limit";
+      readAudioCapture.active = false;
+      return;
+    }
     readAudioCapture.pcmChunks.push(chunk);
+    readAudioCapture.pcmBytes += chunk.byteLength;
     if (Number.isFinite(sampleRate) && sampleRate > 0) readAudioCapture.sampleRate = sampleRate;
     readAudioCapture.lastChunkAt = Date.now();
-    while (readAudioCapture.pcmChunks.length > 2000) readAudioCapture.pcmChunks.shift();
   }
 
   function wrapAudioWorkletPort(node, audioContext) {
@@ -823,12 +841,34 @@
     return pool.at(-1) || null;
   }
 
-  function latestAnswer(prompt) {
-    return latestAnswerCandidate(prompt)?.text || "";
+  function answerSnapshot(prompt) {
+    const candidates = collectAnswerCandidates(prompt);
+    const byElement = new Map();
+    const textCounts = new Map();
+    for (const item of candidates) {
+      byElement.set(item.element, item.text);
+      textCounts.set(item.text, (textCounts.get(item.text) || 0) + 1);
+    }
+    return { byElement, textCounts };
   }
 
-  function answerCount() {
-    return collectAnswerCandidates("").length;
+  function candidatesAfterSnapshot(candidates, snapshot) {
+    const remainingTextCounts = new Map(snapshot.textCounts);
+    return candidates.filter((item) => {
+      const previousText = snapshot.byElement.get(item.element);
+      if (previousText !== undefined) {
+        if (item.text !== previousText) return true;
+        remainingTextCounts.set(item.text, Math.max(0, (remainingTextCounts.get(item.text) || 0) - 1));
+        return false;
+      }
+
+      const remaining = remainingTextCounts.get(item.text) || 0;
+      if (remaining > 0) {
+        remainingTextCounts.set(item.text, remaining - 1);
+        return false;
+      }
+      return true;
+    });
   }
 
   function isGenerating() {
@@ -1059,12 +1099,17 @@
     }
   }
 
-  function uploadToLocalService(cmdId, filename, blob) {
+  function uploadBlobPart(cmdId, filename, blob, part, parts) {
     return new Promise((resolve, reject) => {
-      const query = `?cmd_id=${encodeURIComponent(cmdId)}&filename=${encodeURIComponent(filename)}`;
+      const query = [
+        `cmd_id=${encodeURIComponent(cmdId)}`,
+        `filename=${encodeURIComponent(filename)}`,
+        `part=${part}`,
+        `parts=${parts}`,
+      ].join("&");
       GM_xmlhttpRequest({
         method: "POST",
-        url: `${HTTP_API}/upload${query}`,
+        url: `${HTTP_API}/upload?${query}`,
         headers: { "content-type": blob.type || "application/octet-stream" },
         data: blob,
         timeout: 10 * 60 * 1000,
@@ -1081,13 +1126,25 @@
           }
         },
         onerror() {
-          reject(new Error("Cannot upload podcast to local service"));
+          reject(new Error(`Cannot upload audio part ${part + 1}/${parts} to local service`));
         },
         ontimeout() {
-          reject(new Error("Local upload timed out"));
+          reject(new Error(`Local upload part ${part + 1}/${parts} timed out`));
         },
       });
     });
+  }
+
+  async function uploadToLocalService(cmdId, filename, blob) {
+    const parts = Math.max(1, Math.ceil(blob.size / UPLOAD_CHUNK_BYTES));
+    let result = null;
+    for (let part = 0; part < parts; part += 1) {
+      const start = part * UPLOAD_CHUNK_BYTES;
+      const chunk = blob.slice(start, Math.min(blob.size, start + UPLOAD_CHUNK_BYTES), blob.type);
+      setStatus(`uploading audio\n${part + 1}/${parts}\n${filename}`);
+      result = await uploadBlobPart(cmdId, filename, chunk, part, parts);
+    }
+    return result;
   }
 
   async function downloadPodcastAudio(audio, jobId) {
@@ -1255,6 +1312,7 @@
       while (Date.now() - started < totalTimeoutMs) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         becomeWorker();
+        if (readAudioCapture.error) throw new Error(readAudioCapture.error);
 
         const chunkCount = readAudioCapture.chunks.length + readAudioCapture.pcmChunks.length;
         if (chunkCount !== lastChunkCount) {
@@ -1293,7 +1351,7 @@
     throw new Error(`Timed out waiting for read-aloud audio (chunks=${readAudioCapture.chunks.length + readAudioCapture.pcmChunks.length})`);
   }
 
-  async function waitForAnswer(prompt, baselineCount, baselineAnswer, timeoutMs) {
+  async function waitForAnswer(prompt, baselineSnapshot, timeoutMs) {
     const started = Date.now();
     const totalTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
       ? timeoutMs
@@ -1311,10 +1369,7 @@
       await new Promise((resolve) => setTimeout(resolve, 500));
       becomeWorker();
       const candidates = collectAnswerCandidates(prompt);
-      const newCandidates =
-        candidates.length > baselineCount ? candidates.slice(baselineCount) : candidates;
-      const fallbackCandidates = candidates.filter((item) => item.text !== baselineAnswer);
-      const current = newCandidates.at(-1)?.text || fallbackCandidates.at(-1)?.text || "";
+      const current = candidatesAfterSnapshot(candidates, baselineSnapshot).at(-1)?.text || "";
       if (current && current !== best) {
         best = current;
         stableSince = Date.now();
@@ -1379,8 +1434,7 @@
       if (!input) throw new Error("Could not find Doubao input box after upload");
     }
 
-    const baselineCount = answerCount();
-    const baselineAnswer = latestAnswer(prompt);
+    const baselineSnapshot = answerSnapshot(prompt);
 
     setInputValue(input, prompt);
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -1392,7 +1446,7 @@
     const waitMs = Number(args.wait_ms) || 0;
     const answer = isPodcast
       ? await waitForPodcastDownloadButton(podcastDownloadBaseline, cmd.id)
-      : await waitForAnswer(prompt, baselineCount, baselineAnswer, waitMs);
+      : await waitForAnswer(prompt, baselineSnapshot, waitMs);
 
     if (isRead) {
       const audioWaitMs = Number(args.audio_wait_ms) || PODCAST_TIMEOUT_MS;

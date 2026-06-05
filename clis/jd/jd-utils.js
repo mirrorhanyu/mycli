@@ -200,6 +200,14 @@ function buildImageFilename(imageUrl, index, total) {
   return index === 1 ? `首图${suffix}` : `图${String(index).padStart(2, "0")}${suffix}`;
 }
 
+// Detail-page (商品详情) long-description images live in a 详情页/ subfolder and
+// are simply numbered in document order; their CDN ext (often .png.avif) is kept.
+function buildDetailImageFilename(url, index, total) {
+  const suffix = suffixFromUrl(url, ".jpg");
+  const width = String(total).length;
+  return `${String(index).padStart(Math.max(2, width), "0")}${suffix}`;
+}
+
 function buildVideoFilename(video, index, total, fallbackStem) {
   const videoId = String(video.mainVideoId || "").trim();
   const suffix = suffixFromUrl(String(video.mainUrl || ""), ".mp4");
@@ -345,6 +353,7 @@ module.exports = {
   randomDelay,
   mapWithConcurrency,
   buildImageFilename,
+  buildDetailImageFilename,
   buildVideoFilename,
   mediaKeyFromUrl,
   imageMediaKeys,

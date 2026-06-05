@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         mycli JD Bridge
 // @namespace    local.mycli.jd
-// @version      0.2.9
-// @description  WebSocket bridge to the mycli micro-daemon. Extracts video URLs from JD item pages via hidden iframes.
+// @version      0.3.1
+// @description  WebSocket bridge to the mycli micro-daemon. Extracts video URLs + 详情页 images from JD item pages via hidden iframes.
 // @match        https://item.jd.com/*
 // @noframes
 // @grant        none
@@ -17,7 +17,7 @@
   "use strict";
 
   const SITE = "jd";
-  const VERSION = "0.2.9";
+  const VERSION = "0.3.1";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RECONNECT_MIN_MS = 1000;
@@ -253,50 +253,109 @@
     return attrs;
   }
 
-  // The spec table (.attrs) is an empty placeholder until two things happen:
-  // (1) the "商品详情" tab is clicked, and (2) the section scrolls into a
-  // *painted* viewport (JD lazy-loads it via IntersectionObserver). An
-  // off-screen iframe is never painted, so its IO never fires. So we briefly
-  // bring the frame on-screen but fully transparent + click-through, scroll the
-  // spec section into the iframe's own viewport, wait for rows, then hide again.
-  async function revealAttrs(frame, goodId) {
+  // The 商品详情 long description renders its images as CSS background-image
+  // rules inside <style> tags under #detail-top / #detail-main / #detail-footer
+  // (the ".ssd-module-wrap .Mxxxx{...background-image:url(//img30...png.avif)}"
+  // floor modules). The same "商品详情" tab click that reveals .attrs also injects
+  // these, so we just scrape every url(...) the style tags reference. They are
+  // public CDN assets — no login needed to download.
+  function extractDetailImages(doc) {
+    if (!doc) return [];
+    const urls = [];
+    const seen = new Set();
+    const containers = ["#detail-top", "#detail-main", "#detail-footer"];
+    for (const sel of containers) {
+      const root = doc.querySelector(sel);
+      if (!root) continue;
+      for (const styleEl of root.querySelectorAll("style")) {
+        const css = styleEl.textContent || "";
+        for (const m of css.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g)) {
+          let u = (m[2] || "").trim();
+          if (!u || u.startsWith("data:")) continue;
+          if (u.startsWith("//")) u = "https:" + u;
+          else if (u.startsWith("/")) u = "https://img30.360buyimg.com" + u;
+          if (!/^https?:\/\//.test(u)) continue;
+          if (!seen.has(u)) {
+            seen.add(u);
+            urls.push(u);
+          }
+        }
+      }
+    }
+    return urls;
+  }
+
+  // Both the spec table (.attrs) and the 商品详情 long-description gallery
+  // (#detail-main floor modules) lazy-load via IntersectionObserver, which only
+  // fires while the section is in a *painted* viewport. An off-screen iframe is
+  // never painted, so we briefly bring the frame on-screen but fully transparent
+  // + click-through, then progressively scroll from top to bottom so every floor
+  // module + the spec table mounts. We poll for BOTH attrs and detail images and
+  // extract them while still revealed (the gallery only renders while painted).
+  async function revealDetail(frame, goodId) {
     const doc = frame.contentDocument;
-    if (!doc) return;
-    if (doc.querySelectorAll(".attrs .item").length > 0) return;
+    const out = { attrs: {}, detailImages: [] };
+    if (!doc) return out;
+
     const tab =
       doc.querySelector("#SPXQ-tab-column") ||
       [...doc.querySelectorAll("div")].find(
         (el) => el.textContent.trim() === "商品详情",
       );
-    if (!tab) {
-      logRemote(`[${goodId}] 商品详情 tab not found`);
-      return;
-    }
+    if (!tab) logRemote(`[${goodId}] 商品详情 tab not found`);
 
     const savedStyle = frame.style.cssText;
     frame.style.cssText =
       `position:fixed;left:0;top:0;width:1100px;height:${window.innerHeight}px;` +
       "opacity:0;pointer-events:none;border:0;z-index:2147483646";
     try {
-      tab.click();
+      if (tab) tab.click();
       const win = doc.defaultView;
-      for (let i = 0; i < 30; i += 1) {
-        const attrsEl = doc.querySelector(".attrs");
+      await sleep(400);
+
+      let attrs = {};
+      let detailImages = [];
+      let lastHeight = 0;
+      let stable = 0;
+      // ~40 passes * 300ms caps the worst case at ~12s; we break early as soon
+      // as both targets are present, or once the page has stopped growing at the
+      // bottom (a product that genuinely has no detail gallery).
+      for (let i = 0; i < 40; i += 1) {
         try {
-          if (attrsEl) attrsEl.scrollIntoView({ block: "center" });
-          else if (win) win.scrollTo(0, doc.body.scrollHeight);
+          if (win) {
+            const target = Math.min(
+              (i + 1) * win.innerHeight * 0.8,
+              doc.body.scrollHeight,
+            );
+            win.scrollTo(0, target);
+          }
+          doc.querySelector("#detail-main")?.scrollIntoView({ block: "center" });
         } catch {}
-        if (doc.querySelectorAll(".attrs .item").length > 0) return;
         await sleep(300);
+
+        attrs = extractAttrsFromDoc(doc);
+        detailImages = extractDetailImages(doc);
+        if (Object.keys(attrs).length && detailImages.length) break;
+
+        const height = doc.body.scrollHeight;
+        const atBottom =
+          win && win.innerHeight + win.scrollY >= height - 4;
+        stable = height === lastHeight ? stable + 1 : 0;
+        lastHeight = height;
+        if (atBottom && stable >= 3 && i > 6) break; // settled at the end
       }
-      const attrsEl = doc.querySelector(".attrs");
-      const dump = attrsEl
-        ? attrsEl.outerHTML.replace(/\s+/g, " ").slice(0, 600)
-        : "(none)";
-      logRemote(`[${goodId}] attrs reveal failed; html=${dump}`);
+
+      out.attrs = attrs;
+      out.detailImages = detailImages;
+      if (!Object.keys(attrs).length || !detailImages.length) {
+        logRemote(
+          `[${goodId}] reveal partial: attrs=${Object.keys(attrs).length} detail=${detailImages.length}`,
+        );
+      }
     } finally {
       frame.style.cssText = savedStyle;
     }
+    return out;
   }
 
   async function collectAllVideos(frame, task) {
@@ -368,10 +427,9 @@
         logRemote(
           `[${task.good_id}] videos=${videos.length} (${Date.now() - t0}ms)`,
         );
-        await revealAttrs(frame, task.good_id);
-        const attrs = extractAttrsFromDoc(frame.contentDocument);
+        const { attrs, detailImages } = await revealDetail(frame, task.good_id);
         logRemote(
-          `[${task.good_id}] DONE attrs=${Object.keys(attrs).length} (${Date.now() - t0}ms)`,
+          `[${task.good_id}] DONE attrs=${Object.keys(attrs).length} detail=${detailImages.length} (${Date.now() - t0}ms)`,
         );
         const first = videos[0] || null;
         results.push({
@@ -384,6 +442,7 @@
           posterUrl: first?.posterUrl || null,
           videoDuration: first?.videoDuration ?? null,
           attrs,
+          detailImages,
           error: null,
         });
       } catch (error) {
@@ -400,6 +459,7 @@
           posterUrl: null,
           videoDuration: null,
           attrs: {},
+          detailImages: [],
           error: String(error.message || error),
         });
       }

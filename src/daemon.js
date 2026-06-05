@@ -11,9 +11,10 @@ const { loadAllSites, userscriptPath } = require("./registry.js");
 loadAllSites();
 
 const DEFAULT_TIMEOUT_MS = 120000;
-const MAX_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_TIMEOUT_MS = 45 * 60 * 1000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
+const MAX_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024;
 const DOWNLOAD_DIR = path.join(os.homedir(), "Downloads");
 const HEARTBEAT_MS = 15000;
 
@@ -23,6 +24,8 @@ const sitePeers = new Map();
 const siteSessions = new Map();
 // command_id -> { site, action, args, resolve, reject, timer, dispatched }
 const pending = new Map();
+// upload key -> { savePath, tempPath, parts, nextPart, size }
+const activeUploads = new Map();
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -251,40 +254,76 @@ function handleUpload(req, res, url) {
   }
   const filename = safeFilename(url.searchParams.get("filename") || "mycli-upload");
   const outputDir = (entry.args && entry.args.output_dir) ? path.resolve(String(entry.args.output_dir)) : DOWNLOAD_DIR;
-  let savePath;
-  try {
-    savePath = uniquePath(outputDir, filename);
-  } catch (error) {
-    sendJson(req, res, 500, { ok: false, error: `Cannot create directory: ${error.message}` });
+  const part = Number(url.searchParams.get("part") || 0);
+  const parts = Number(url.searchParams.get("parts") || 1);
+  if (!Number.isInteger(part) || !Number.isInteger(parts) || part < 0 || parts < 1 || part >= parts) {
+    sendJson(req, res, 400, { ok: false, error: "Invalid upload part" });
+    return;
+  }
+
+  const uploadKey = `${cmdId}\0${filename}`;
+  let upload = activeUploads.get(uploadKey);
+  if (part === 0) {
+    try {
+      const savePath = uniquePath(outputDir, filename);
+      const tempPath = `${savePath}.part`;
+      fs.rmSync(tempPath, { force: true });
+      upload = { savePath, tempPath, parts, nextPart: 0, size: 0 };
+      activeUploads.set(uploadKey, upload);
+    } catch (error) {
+      sendJson(req, res, 500, { ok: false, error: `Cannot create upload: ${error.message}` });
+      return;
+    }
+  }
+  if (!upload || upload.parts !== parts || upload.nextPart !== part) {
+    sendJson(req, res, 409, { ok: false, error: `Unexpected upload part ${part + 1}/${parts}` });
     return;
   }
 
   const chunks = [];
   let total = 0;
-  let aborted = false;
+  let tooLarge = false;
   req.on("data", (chunk) => {
     total += chunk.length;
-    if (total > MAX_UPLOAD_BYTES) {
-      aborted = true;
-      req.destroy();
+    if (total > MAX_UPLOAD_CHUNK_BYTES || upload.size + total > MAX_UPLOAD_BYTES) {
+      tooLarge = true;
     } else {
       chunks.push(chunk);
     }
   });
   req.on("end", () => {
-    if (aborted) {
+    if (tooLarge) {
+      activeUploads.delete(uploadKey);
+      try { fs.rmSync(upload.tempPath, { force: true }); } catch {}
       sendJson(req, res, 413, { ok: false, error: "Upload too large" });
       return;
     }
     try {
-      fs.writeFileSync(savePath, Buffer.concat(chunks));
+      fs.appendFileSync(upload.tempPath, Buffer.concat(chunks));
+      upload.size += total;
+      upload.nextPart += 1;
+      if (upload.nextPart === upload.parts) {
+        fs.renameSync(upload.tempPath, upload.savePath);
+        activeUploads.delete(uploadKey);
+      }
     } catch (error) {
+      activeUploads.delete(uploadKey);
+      try { fs.rmSync(upload.tempPath, { force: true }); } catch {}
       sendJson(req, res, 500, { ok: false, error: `Failed to save: ${error.message}` });
       return;
     }
-    sendJson(req, res, 200, { ok: true, path: savePath, size: total });
+    sendJson(req, res, 200, {
+      ok: true,
+      complete: upload.nextPart === upload.parts,
+      part: upload.nextPart,
+      parts: upload.parts,
+      path: upload.nextPart === upload.parts ? upload.savePath : null,
+      size: upload.size,
+    });
   });
   req.on("error", (error) => {
+    activeUploads.delete(uploadKey);
+    try { fs.rmSync(upload.tempPath, { force: true }); } catch {}
     sendJson(req, res, 500, { ok: false, error: error.message || String(error) });
   });
 }
@@ -538,6 +577,10 @@ function shutdown() {
     entry.reject(new Error("Daemon shutting down"));
   }
   pending.clear();
+  for (const [, upload] of activeUploads) {
+    try { fs.rmSync(upload.tempPath, { force: true }); } catch {}
+  }
+  activeUploads.clear();
   siteSessions.clear();
   for (const [, entry] of sitePeers) {
     try { entry.ws.close(); } catch {}
