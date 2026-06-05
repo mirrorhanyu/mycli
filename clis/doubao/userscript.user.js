@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.5.7
+// @version      0.5.6
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.5.7";
+  const VERSION = "0.5.6";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -700,18 +700,6 @@
     input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  function findUploadFileInput() {
-    const inputs = [...document.querySelectorAll("input[type='file']")];
-    return (
-      inputs.find((item) => {
-        const accept = String(item.getAttribute("accept") || "").toLowerCase();
-        return item.multiple || /png|jpg|jpeg|webp|pdf|doc|xls|ppt|txt|md/.test(accept);
-      }) ||
-      inputs.at(-1) ||
-      null
-    );
-  }
-
   function uploadRegion(input) {
     return input.closest("form") || input.parentElement || document.body;
   }
@@ -758,14 +746,13 @@
       files.push(await attachmentToFile(attachment));
     }
 
-    let fileInput = findUploadFileInput();
-    if (!fileInput) {
-      const beforeInputs = new Set([...document.querySelectorAll("input[type='file']")]);
-      await openUploadMenu(input);
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    const beforeInputs = new Set([...document.querySelectorAll("input[type='file']")]);
+    await openUploadMenu(input);
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
-      fileInput = [...document.querySelectorAll("input[type='file']")].find((item) => !beforeInputs.has(item)) || findUploadFileInput();
-    }
+    const fileInput =
+      [...document.querySelectorAll("input[type='file']")].find((item) => !beforeInputs.has(item)) ||
+      [...document.querySelectorAll("input[type='file']")].at(-1);
     if (!fileInput) {
       throw new Error("Could not find file upload input");
     }
