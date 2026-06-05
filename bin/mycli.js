@@ -6,21 +6,43 @@ const { ensureDaemon, shutdownDaemon, status, sendCommand, API, LOG_PATH } = req
 function parseArgs(argv) {
   const options = {};
   const positional = [];
+  const ordered = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      const next = argv[i + 1];
-      if (next === undefined || next.startsWith("--")) {
-        options[key] = true;
+      const body = arg.slice(2);
+      const eq = body.indexOf("=");
+      let key;
+      let value;
+      if (eq >= 0) {
+        key = body.slice(0, eq);
+        value = body.slice(eq + 1);
       } else {
-        options[key] = next;
-        i += 1;
+        key = body;
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith("--")) {
+          value = true;
+        } else {
+          value = next;
+          i += 1;
+        }
       }
+      if (options[key] === undefined) {
+        options[key] = value;
+      } else if (Array.isArray(options[key])) {
+        options[key].push(value);
+      } else {
+        options[key] = [options[key], value];
+      }
+      ordered.push({ key, value });
     } else {
       positional.push(arg);
     }
   }
+  Object.defineProperty(options, "__ordered", {
+    value: ordered,
+    enumerable: false,
+  });
   return { options, positional };
 }
 
@@ -40,6 +62,7 @@ function usage() {
   lines.push("");
   lines.push("Examples:");
   lines.push('  mycli doubao ask --text "3+2 等于多少"');
+  lines.push('  mycli doubao ask --text "识别图片" --attach a.png --attach b.png');
   lines.push("  mycli doubao read --file ./file.md --out-dir ./audio");
   lines.push("  mycli doubao podcast --file ./material.pdf");
   lines.push("  mycli bilibili recent 402626075 123456789 --days 7 --limit 3");

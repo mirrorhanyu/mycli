@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.5.5
+// @version      0.5.6
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.5.5";
+  const VERSION = "0.5.6";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -700,23 +700,54 @@
     input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  async function uploadFiles(input, attachments) {
+  function uploadRegion(input) {
+    return input.closest("form") || input.parentElement || document.body;
+  }
+
+  async function waitForUploadSettled(input, timeoutMs = 60000) {
+    const region = uploadRegion(input);
+    let lastMutationAt = Date.now();
+    const observer = new MutationObserver(() => {
+      lastMutationAt = Date.now();
+    });
+    observer.observe(region, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      characterData: true,
+    });
+
+    try {
+      const started = Date.now();
+      while (Date.now() - started < timeoutMs) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const text = (region.innerText || document.body.innerText || "").replace(/\s+/g, " ");
+        const busy = /上传中|正在上传|处理中|解析中/.test(text);
+        if (!busy && Date.now() - lastMutationAt >= 1200) {
+          return;
+        }
+      }
+    } finally {
+      observer.disconnect();
+    }
+    throw new Error("Timed out waiting for file upload");
+  }
+
+  async function uploadFiles(input, attachments, options = {}) {
     if (!attachments?.length) {
-      throw new Error("Podcast job is missing attachment");
+      throw new Error("Job is missing attachment");
     }
 
-    await ensurePodcastMode(input);
+    if (options.podcastMode) {
+      await ensurePodcastMode(input);
+    }
     const files = [];
     for (const attachment of attachments) {
       files.push(await attachmentToFile(attachment));
     }
 
     const beforeInputs = new Set([...document.querySelectorAll("input[type='file']")]);
-    const plusButton = findPlusButton(input);
-    if (!plusButton) {
-      throw new Error("Could not find Doubao plus button");
-    }
-    plusButton.click();
+    await openUploadMenu(input);
     await new Promise((resolve) => setTimeout(resolve, 500));
 
     const fileInput =
@@ -728,21 +759,7 @@
 
     setStatus(`uploading file\n${files.map((file) => file.name).join(", ")}`);
     setFilesOnInput(fileInput, files);
-    await waitForUploadedFile(files[0].name);
-  }
-
-  async function waitForUploadedFile(fileName) {
-    const stem = fileName.replace(/\.[^.]+$/, "");
-    const started = Date.now();
-    while (Date.now() - started < 60000) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      const text = document.body.innerText || "";
-      if (text.includes(fileName) || (stem && stem.length > 2 && text.includes(stem))) {
-        await new Promise((resolve) => setTimeout(resolve, 1200));
-        return;
-      }
-    }
-    throw new Error("Timed out waiting for file upload");
+    await waitForUploadSettled(input);
   }
 
   function buttonText(button) {
@@ -1422,14 +1439,14 @@
 
     const isPodcast = cmd.action === "podcast";
     const isRead = cmd.action === "read";
+    const attachments = (args.attachments || []).map((att) => ({
+      url: att.url,
+      name: att.name,
+      mime: att.mime,
+    }));
     const podcastDownloadBaseline = collectPodcastDownloadButtons().length;
-    if (isPodcast) {
-      const attachments = (args.attachments || []).map((att) => ({
-        url: att.url,
-        name: att.name,
-        mime: att.mime,
-      }));
-      await uploadFiles(input, attachments);
+    if (attachments.length) {
+      await uploadFiles(input, attachments, { podcastMode: isPodcast });
       input = findInput();
       if (!input) throw new Error("Could not find Doubao input box after upload");
     }
