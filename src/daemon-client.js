@@ -139,11 +139,11 @@ function postJson(url, body) {
   });
 }
 
-async function sendCommand({ site, action, args = {}, timeoutMs }) {
+async function sendCommand({ site, account, action, args = {}, timeoutMs }) {
   await ensureDaemon();
   // Native fetch has a response-headers timeout that is shorter than long
   // browser jobs. Keep this request open and let the daemon enforce timeoutMs.
-  const res = await postJson(`${API}/command`, { site, action, args, timeout_ms: timeoutMs });
+  const res = await postJson(`${API}/command`, { site, account, action, args, timeout_ms: timeoutMs });
   const payload = res.json;
   if (!res.ok || payload.ok === false) {
     throw new Error(payload.error || `HTTP ${res.status}`);

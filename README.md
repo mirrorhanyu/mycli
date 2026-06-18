@@ -40,6 +40,9 @@ mycli doubao ask --text "按顺序识别这些图片" --attach ./7.png --attach 
 mycli doubao read --file ./file.md --out-dir ./audio
 mycli doubao podcast --file ./material.pdf --out-dir ./audio
 mycli bilibili recent 402626075 123456789 --days 7 --limit 3
+mycli bilibili sell 稿件/20260608-122739/bilibili.json
+mycli bilibili sell 稿件/20260608-122739/bilibili.json --force
+node scripts/generate_bilibili_comment_md.js --bilibili-json /path/to/bilibili.json --hyperframe-input /path/to/hyperframe-input.json
 ```
 
 For `mycli doubao ask`:
@@ -53,7 +56,7 @@ mycli daemon start | stop | restart | status | logs
 
 ## Add a new site
 
-The micro-daemon is site-agnostic. Each userscript registers itself by sending `{type:"hello", site:"<name>"}` and the daemon routes commands keyed by `site`.
+The micro-daemon is site-agnostic. Each userscript registers itself by sending `{type:"hello", site:"<name>"}` and the daemon routes commands keyed by `site`. A hello may also carry `accountId`/`accountName`; sites that report accounts get one connected page per account (see the Bilibili section), while sites that don't keep the legacy single-page slot.
 
 To add `mycli <newsite> <cmd>`:
 
@@ -67,11 +70,24 @@ clis/
 
 ### Bilibili site
 
-`mycli bilibili recent` looks up recent uploads for one or more mids inside a browser session that is already logged in to Bilibili. Open any Bilibili page first, then install the userscript:
+`mycli bilibili recent` looks up recent uploads for one or more mids inside a browser session that is already logged in to Bilibili. `mycli bilibili sell <json>` uploads commerce items from a JSON file and rewrites compact fields such as `bilibili_short_url` in place. By default it skips rows that already have `sell_status: "ok"` unless you pass `--force`. Open the Bilibili account page you want to bind first, then install the userscript:
 
 ```sh
 open http://127.0.0.1:17872/userscript/bilibili/mycli.user.js
 ```
+
+After installation, the status box shows the current page account name and the locked account name. Use `切换为<账号>` to bind the page you want to control, or `退出<账号>` to release it.
+
+Multiple accounts can stay connected at the same time (one page per account — e.g. two browser profiles each logged in to a different Bilibili account). Pages of *different* accounts never kick each other. If two pages are logged in to the *same* account, the first one keeps serving and later ones stand by (`本页待命`); click `在本页接管` to move the connection over explicitly.
+
+With more than one account connected, pass `--account <昵称|mid>` to choose which page runs the command:
+
+```sh
+mycli bilibili sell items.json --account 某账号昵称
+mycli bilibili recent 402626075 --account 12345678
+```
+
+Without `--account`, commands run on the only connected account, or fail with a list of connected accounts when there are several. `mycli daemon status` shows which accounts are connected.
 
 Each Node-side command file:
 
@@ -94,7 +110,7 @@ The userscript receives `{type:"command", id, action, args}` over WS, runs whate
 HTTP (CLI ↔ daemon):
 - `GET  /ping` — health
 - `GET  /status` — pid, uptime, connected sites
-- `POST /command` — `{site, action, args, timeout_ms}` → `{ok, result}`
+- `POST /command` — `{site, account?, action, args, timeout_ms}` → `{ok, result}`; `account` matches the userscript-reported account id or name when several accounts are connected for one site
 - `POST /shutdown`
 - `GET  /userscript/<site>/mycli.user.js` — serve userscript for installation
 - `GET  /attachment/<cmd_id>/<idx>` — userscript fetches local file by URL

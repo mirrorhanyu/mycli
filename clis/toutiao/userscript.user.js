@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Toutiao Bridge
 // @namespace    local.mycli.toutiao
-// @version      0.4.2
+// @version      0.4.4
 // @description  WebSocket bridge to the mycli micro-daemon. Drives mp.toutiao.com on behalf of the CLI.
 // @match        https://mp.toutiao.com/*
 // @downloadURL  http://127.0.0.1:17872/userscript/toutiao/mycli.user.js
@@ -20,7 +20,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "toutiao";
-  const VERSION = "0.4.2";
+  const VERSION = "0.4.4";
   const UPLOAD_SOURCE = 20020002;
   const PUBLISH_ENV_TIMEOUT_MS = 15000;
   const PUBLISH_ENV_INTERVAL_MS = 250;
@@ -36,23 +36,49 @@
   let reconnectDelay = RECONNECT_MIN_MS;
 
   // ── Status box ───────────────────────────────────────────────────────────
-  // --- Status overlay (auto-tucks to the edge after 3s; click to toggle) ---
+  // --- Status overlay (unified mycli style; click toggles, swipe right tucks) ---
+  const STATUS_ID = "mycli-toutiao-status";
   const STATUS_COLLAPSE_MS = 3000;
+  const STATUS_PEEK_PX = 18;
+  const STATUS_SWIPE_PX = 48;
+  const STATUS_BOX_CSS = [
+    "position:fixed",
+    "right:0",
+    "top:72px",
+    "z-index:2147483647",
+    "background:rgba(17,24,39,.92)",
+    "color:#fff",
+    "font:12px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "padding:8px 10px",
+    "border-radius:10px 0 0 10px",
+    "border-left:3px solid #3b82f6",
+    "box-shadow:0 8px 24px rgba(0,0,0,.18)",
+    "max-width:320px",
+    "white-space:pre-wrap",
+    "cursor:pointer",
+    "user-select:none",
+    "touch-action:none",
+    "transition:transform .25s ease, opacity .25s ease",
+  ].join(";");
   let statusCollapsed = false;
   let statusCollapseTimer = null;
   let statusBox = null;
 
-  function renderStatus() {
+  function applyStatusTransform() {
     if (!statusBox) return;
     if (statusCollapsed) {
-      statusBox.textContent = "\u2261"; // collapsed handle: ≡
-      statusBox.style.transform = "translateX(14px)";
-      statusBox.style.opacity = "0.6";
+      statusBox.style.transform = `translateX(calc(100% - ${STATUS_PEEK_PX}px))`;
+      statusBox.style.opacity = "0.7";
     } else {
-      statusBox.textContent = statusBox.dataset.full || "";
       statusBox.style.transform = "none";
       statusBox.style.opacity = "1";
     }
+  }
+
+  function renderStatus() {
+    if (!statusBox) return;
+    statusBox.textContent = statusBox.dataset.full || "";
+    applyStatusTransform();
   }
 
   function collapseStatus() {
@@ -66,36 +92,96 @@
     clearTimeout(statusCollapseTimer);
     statusCollapseTimer = setTimeout(collapseStatus, STATUS_COLLAPSE_MS);
   }
-  function setStatus(text) {
-    lastStatus = text;
-    let box = document.getElementById("mycli-toutiao-status");
-    if (!box) {
-      box = document.createElement("div");
-      box.id = "mycli-toutiao-status";
-      box.style.cssText = [
-        "position:fixed",
-        "right:14px",
-        "top:14px",
-        "z-index:2147483647",
-        "background:#111827",
-        "color:#fff",
-        "font:12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
-        "padding:8px 10px",
-        "border-radius:8px",
-        "box-shadow:0 8px 24px rgba(0,0,0,.18)",
-        "max-width:260px",
-        "white-space:pre-wrap",
-        "cursor:pointer",
-        "user-select:none",
-        "transition:opacity .2s ease, transform .2s ease",
-      ].join(";");
-      document.documentElement.appendChild(box);
-    }
-    statusBox = box;
-    box.onclick = () => {
+
+  function attachStatusGestures(box) {
+    let suppressClick = false;
+
+    box.addEventListener("click", () => {
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
       if (statusCollapsed) expandStatus();
       else collapseStatus();
+    });
+
+    // Two-finger trackpad swipe right tucks the box away, like a macOS notification.
+    let wheelAccum = 0;
+    let wheelResetTimer = null;
+    box.addEventListener("wheel", (event) => {
+      if (statusCollapsed || Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;
+      event.preventDefault();
+      wheelAccum = Math.max(0, wheelAccum + event.deltaX);
+      clearTimeout(wheelResetTimer);
+      if (wheelAccum >= STATUS_SWIPE_PX) {
+        wheelAccum = 0;
+        collapseStatus();
+        return;
+      }
+      box.style.transform = `translateX(${wheelAccum}px)`;
+      wheelResetTimer = setTimeout(() => {
+        wheelAccum = 0;
+        applyStatusTransform();
+      }, 250);
+    }, { passive: false });
+
+    // Dragging the box to the right also tucks it away.
+    let dragPointerId = null;
+    let dragStartX = 0;
+    let dragDx = 0;
+    const endStatusDrag = (event) => {
+      if (dragPointerId !== event.pointerId) return;
+      dragPointerId = null;
+      box.style.transition = "transform .25s ease, opacity .25s ease";
+      if (dragDx > 4) suppressClick = true;
+      if (dragDx >= STATUS_SWIPE_PX) collapseStatus();
+      else applyStatusTransform();
+      dragDx = 0;
     };
+    box.addEventListener("pointerdown", (event) => {
+      if (statusCollapsed || event.button !== 0) return;
+      dragPointerId = event.pointerId;
+      dragStartX = event.clientX;
+      dragDx = 0;
+    });
+    box.addEventListener("pointermove", (event) => {
+      if (dragPointerId !== event.pointerId) return;
+      dragDx = event.clientX - dragStartX;
+      if (dragDx > 4) {
+        try { box.setPointerCapture(event.pointerId); } catch {}
+        box.style.transition = "none";
+        box.style.transform = `translateX(${dragDx}px)`;
+      }
+    });
+    box.addEventListener("pointerup", endStatusDrag);
+    box.addEventListener("pointercancel", endStatusDrag);
+  }
+
+  function ensureStatusBox() {
+    if (statusBox) return statusBox;
+    let box = document.getElementById(STATUS_ID);
+    if (!box) {
+      box = document.createElement("div");
+      box.id = STATUS_ID;
+      box.style.cssText = STATUS_BOX_CSS;
+      attachStatusGestures(box);
+      const mountStatusBox = () => {
+        const target = document.body || document.documentElement || document.head;
+        if (!target) {
+          requestAnimationFrame(mountStatusBox);
+          return;
+        }
+        target.appendChild(box);
+      };
+      mountStatusBox();
+    }
+    statusBox = box;
+    return box;
+  }
+
+  function setStatus(text) {
+    lastStatus = text;
+    const box = ensureStatusBox();
     box.dataset.full = `mycli/${SITE} ${VERSION}\n${text}`;
     expandStatus();
   }

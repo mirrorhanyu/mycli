@@ -18,11 +18,13 @@ const MAX_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024;
 const DOWNLOAD_DIR = path.join(os.homedir(), "Downloads");
 const HEARTBEAT_MS = 15000;
 
-// site -> { ws, version, contextId, lastSeenAt }
+// site -> Map(accountKey -> { ws, version, contextId, accountId, accountName, lastSeenAt })
+// accountKey is the userscript-reported accountId, or "" for sites that do not
+// report accounts (legacy single-slot behavior).
 const sitePeers = new Map();
-// site -> { cookie, updatedAt, contextId, url }
+// site -> Map(accountKey -> { cookie, accountId, accountName, updatedAt, contextId, url })
 const siteSessions = new Map();
-// command_id -> { site, action, args, resolve, reject, timer, dispatched }
+// command_id -> { site, accountKey, action, args, resolve, reject, timer, dispatched }
 const pending = new Map();
 // upload key -> { savePath, tempPath, parts, nextPart, size }
 const activeUploads = new Map();
@@ -82,14 +84,47 @@ function readJsonBody(req) {
   });
 }
 
-function activeSitePeer(site) {
-  const entry = sitePeers.get(site);
-  if (!entry) return null;
-  if (entry.ws.readyState !== WebSocket.OPEN) {
-    sitePeers.delete(site);
-    return null;
+function sitePeerMap(site) {
+  let peers = sitePeers.get(site);
+  if (!peers) {
+    peers = new Map();
+    sitePeers.set(site, peers);
   }
-  return entry;
+  return peers;
+}
+
+function livePeers(site) {
+  const peers = sitePeers.get(site);
+  if (!peers) return [];
+  for (const [key, entry] of peers) {
+    if (entry.ws.readyState !== WebSocket.OPEN) peers.delete(key);
+  }
+  return [...peers.entries()];
+}
+
+function describePeers(peers) {
+  return peers
+    .map(([, entry]) => entry.accountName || entry.accountId || entry.contextId || "?")
+    .join(", ");
+}
+
+function resolvePeer(site, account) {
+  const peers = livePeers(site);
+  if (!peers.length) {
+    throw new Error(`No userscript connected for site "${site}". Install the Tampermonkey script and open the page.`);
+  }
+  const wanted = String(account || "").trim();
+  if (wanted) {
+    const found = peers.find(([, entry]) => entry.accountId === wanted || entry.accountName === wanted);
+    if (!found) {
+      throw new Error(`No connected page for account "${wanted}" on ${site}. Connected: ${describePeers(peers)}`);
+    }
+    return found;
+  }
+  if (peers.length > 1) {
+    throw new Error(`Multiple accounts connected for ${site}: ${describePeers(peers)}. Pass --account <name|id> to choose one.`);
+  }
+  return peers[0];
 }
 
 function failPending(cmdId, message) {
@@ -100,9 +135,9 @@ function failPending(cmdId, message) {
   entry.reject(new Error(message));
 }
 
-function failAllForSite(site, message) {
+function failAllForPeer(site, accountKey, message) {
   for (const [id, entry] of pending) {
-    if (entry.site !== site) continue;
+    if (entry.site !== site || entry.accountKey !== accountKey) continue;
     clearTimeout(entry.timer);
     pending.delete(id);
     entry.reject(new Error(message));
@@ -113,22 +148,30 @@ function sessionSummary(site, session) {
   return {
     site,
     hasCookie: Boolean(session?.cookie),
+    hasAccount: Boolean(session?.accountId),
+    accountName: session?.accountName || null,
     updatedAt: Number(session?.updatedAt) || 0,
     contextId: session?.contextId || null,
     url: session?.url || null,
   };
 }
 
-function upsertSiteSession(site, payload = {}) {
-  const cookie = String(payload.cookie || "").trim();
-  if (!cookie) return null;
+function upsertSiteSession(site, accountKey, payload = {}) {
+  let sessions = siteSessions.get(site);
+  if (!sessions) {
+    sessions = new Map();
+    siteSessions.set(site, sessions);
+  }
+  const previous = sessions.get(accountKey) || {};
   const session = {
-    cookie,
+    cookie: payload.cookie === undefined ? String(previous.cookie || "") : String(payload.cookie || "").trim(),
+    accountId: payload.accountId === undefined ? String(previous.accountId || "") : String(payload.accountId || "").trim(),
+    accountName: payload.accountName === undefined ? String(previous.accountName || "") : String(payload.accountName || "").trim(),
     updatedAt: Number(payload.updatedAt) > 0 ? Number(payload.updatedAt) : Date.now(),
-    contextId: payload.contextId ? String(payload.contextId) : null,
-    url: payload.url ? String(payload.url) : null,
+    contextId: payload.contextId === undefined ? (previous.contextId || null) : (payload.contextId ? String(payload.contextId) : null),
+    url: payload.url === undefined ? (previous.url || null) : (payload.url ? String(payload.url) : null),
   };
-  siteSessions.set(site, session);
+  sessions.set(accountKey, session);
   return session;
 }
 
@@ -169,11 +212,14 @@ function normalizeAttachments(args) {
   return list;
 }
 
-function dispatchCommand({ site, action, args, timeoutMs }) {
+function dispatchCommand({ site, account, action, args, timeoutMs }) {
   return new Promise((resolve, reject) => {
-    const peer = activeSitePeer(site);
-    if (!peer) {
-      reject(new Error(`No userscript connected for site "${site}". Install the Tampermonkey script and open the page.`));
+    let accountKey;
+    let peer;
+    try {
+      [accountKey, peer] = resolvePeer(site, account);
+    } catch (error) {
+      reject(error);
       return;
     }
 
@@ -191,7 +237,7 @@ function dispatchCommand({ site, action, args, timeoutMs }) {
       reject(new Error(`Command timeout after ${Math.round(timeoutMs / 1000)}s`));
     }, Math.min(timeoutMs || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS));
 
-    const entry = { id, site, action, args, attachments, resolve, reject, timer, dispatched: false };
+    const entry = { id, site, accountKey, action, args, attachments, resolve, reject, timer, dispatched: false };
     pending.set(id, entry);
 
     // Replace local path with a daemon-served URL the userscript can GM_xmlhttpRequest.
@@ -344,16 +390,26 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && pathname === "/status") {
-    const sites = [...sitePeers.entries()]
-      .filter(([, entry]) => entry.ws.readyState === WebSocket.OPEN)
-      .map(([site, entry]) => ({
-        site,
-        version: entry.version,
-        contextId: entry.contextId,
-        lastSeenAt: entry.lastSeenAt,
-        pending: [...pending.values()].filter((p) => p.site === site).length,
-      }));
-    const sessions = [...siteSessions.entries()].map(([site, session]) => sessionSummary(site, session));
+    const sites = [];
+    for (const site of sitePeers.keys()) {
+      for (const [accountKey, entry] of livePeers(site)) {
+        sites.push({
+          site,
+          version: entry.version,
+          contextId: entry.contextId,
+          accountId: entry.accountId || null,
+          accountName: entry.accountName || null,
+          lastSeenAt: entry.lastSeenAt,
+          pending: [...pending.values()].filter((p) => p.site === site && p.accountKey === accountKey).length,
+        });
+      }
+    }
+    const sessions = [];
+    for (const [site, perAccount] of siteSessions.entries()) {
+      for (const session of perAccount.values()) {
+        sessions.push(sessionSummary(site, session));
+      }
+    }
     sendJson(req, res, 200, {
       ok: true,
       pid: process.pid,
@@ -434,11 +490,17 @@ async function handleRequest(req, res) {
       sendJson(req, res, 400, { ok: false, error: "Missing site or action" });
       return;
     }
+    const account = String(body.account || "").trim();
     const timeoutMs = Number(body.timeout_ms) > 0 ? Number(body.timeout_ms) : DEFAULT_TIMEOUT_MS;
+    const started = Date.now();
+    const argsPreview = JSON.stringify(body.args || {});
+    log(`[cmd] ${site}${account ? `@${account}` : ""} ${action} args=${argsPreview.length > 300 ? `${argsPreview.slice(0, 300)}…` : argsPreview}`);
     try {
-      const result = await dispatchCommand({ site, action, args: body.args || {}, timeoutMs });
+      const result = await dispatchCommand({ site, account, action, args: body.args || {}, timeoutMs });
+      log(`[cmd] ${site} ${action} ok (${((Date.now() - started) / 1000).toFixed(1)}s)`);
       sendJson(req, res, 200, { ok: true, result });
     } catch (error) {
+      log(`[cmd] ${site} ${action} failed (${((Date.now() - started) / 1000).toFixed(1)}s): ${error.message || error}`);
       sendJson(req, res, 502, { ok: false, error: error.message || String(error) });
     }
     return;
@@ -463,6 +525,7 @@ wss.on("connection", (ws, req) => {
   log(`[ws] connected from ${req.socket.remoteAddress}`);
 
   let registeredSite = null;
+  let registeredAccountKey = null;
   let missedPongs = 0;
   const heartbeat = setInterval(() => {
     if (ws.readyState !== WebSocket.OPEN) {
@@ -492,18 +555,60 @@ wss.on("connection", (ws, req) => {
     if (msg.type === "hello") {
       const site = String(msg.site || "").trim();
       if (!site) return;
-      const previous = sitePeers.get(site);
+      const accountId = msg.accountId ? String(msg.accountId) : "";
+      const accountKey = accountId;
+      const peers = sitePeerMap(site);
+      const previous = peers.get(accountKey);
       if (previous && previous.ws !== ws) {
+        const previousAlive = previous.ws.readyState === WebSocket.OPEN;
+        if (previousAlive && accountId && msg.takeover !== true) {
+          // A healthy page already serves this account. Reject the newcomer so
+          // pages never steal the slot from each other automatically; the user
+          // takes over explicitly from the status box (hello with takeover).
+          try {
+            ws.send(JSON.stringify({
+              type: "hello_rejected",
+              site,
+              reason: "account_in_use",
+              accountId,
+              accountName: previous.accountName || null,
+            }));
+          } catch {}
+          try { ws.close(); } catch {}
+          log(`[ws] site ${site}: rejected duplicate page for account ${msg.accountName || accountId}`);
+          return;
+        }
+        // Same account takeover (or legacy site without account ids): tell the
+        // old page it has been replaced so it stands down instead of fighting
+        // the new page in an endless reconnect loop.
+        if (previousAlive) {
+          try {
+            previous.ws.send(JSON.stringify({
+              type: "superseded",
+              site,
+              by: {
+                contextId: msg.contextId || null,
+                accountId: accountId || null,
+                accountName: msg.accountName ? String(msg.accountName) : null,
+              },
+            }));
+          } catch {}
+        }
         try { previous.ws.close(); } catch {}
+        failAllForPeer(site, accountKey, "Userscript superseded by another page");
+        log(`[ws] site ${site}: previous peer superseded by ${msg.accountName || msg.contextId || "new peer"}`);
       }
       registeredSite = site;
-      sitePeers.set(site, {
+      registeredAccountKey = accountKey;
+      peers.set(accountKey, {
         ws,
         version: msg.version || null,
         contextId: msg.contextId || null,
+        accountId: accountId || null,
+        accountName: msg.accountName ? String(msg.accountName) : null,
         lastSeenAt: Date.now(),
       });
-      log(`[ws] site registered: ${site} v${msg.version || "?"}`);
+      log(`[ws] site registered: ${site}${accountId ? ` account=${msg.accountName || accountId}` : ""} v${msg.version || "?"}`);
       try { ws.send(JSON.stringify({ type: "hello_ack", site })); } catch {}
       return;
     }
@@ -512,11 +617,15 @@ wss.on("connection", (ws, req) => {
       const site = String(msg.site || registeredSite || "").trim();
       if (!site) return;
       if (registeredSite && site !== registeredSite) return;
-      const peer = sitePeers.get(site);
+      const accountKey = registeredAccountKey ?? (msg?.data?.accountId ? String(msg.data.accountId) : "");
+      const peer = sitePeers.get(site)?.get(accountKey);
       if (peer && peer.ws === ws) {
         peer.lastSeenAt = Date.now();
       }
-      upsertSiteSession(site, {
+      upsertSiteSession(site, accountKey, {
+        accountId: msg?.data?.accountId,
+        accountName: msg?.data?.accountName,
+        isLogin: msg?.data?.isLogin,
         cookie: msg?.data?.cookie,
         updatedAt: msg?.data?.updatedAt,
         contextId: msg.contextId || peer?.contextId || null,
@@ -545,11 +654,13 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    log(`[ws] closed (site=${registeredSite || "?"})`);
+    log(`[ws] closed (site=${registeredSite || "?"}${registeredAccountKey ? ` account=${registeredAccountKey}` : ""})`);
     clearInterval(heartbeat);
-    if (registeredSite && sitePeers.get(registeredSite)?.ws === ws) {
-      sitePeers.delete(registeredSite);
-      failAllForSite(registeredSite, "Userscript disconnected");
+    if (registeredSite === null) return;
+    const peers = sitePeers.get(registeredSite);
+    if (peers?.get(registeredAccountKey)?.ws === ws) {
+      peers.delete(registeredAccountKey);
+      failAllForPeer(registeredSite, registeredAccountKey, "Userscript disconnected");
     }
   });
 
@@ -582,8 +693,10 @@ function shutdown() {
   }
   activeUploads.clear();
   siteSessions.clear();
-  for (const [, entry] of sitePeers) {
-    try { entry.ws.close(); } catch {}
+  for (const peers of sitePeers.values()) {
+    for (const entry of peers.values()) {
+      try { entry.ws.close(); } catch {}
+    }
   }
   try { httpServer.close(); } catch {}
   setTimeout(() => process.exit(0), 100);

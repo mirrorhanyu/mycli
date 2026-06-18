@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.5.6
+// @version      0.5.18
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.5.6";
+  const VERSION = "0.5.18";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -63,23 +63,49 @@
   let reconnectTimer = null;
   let reconnectDelay = RECONNECT_MIN_MS;
 
-  // --- Status overlay (auto-tucks to the edge after 3s; click to toggle) ---
+  // --- Status overlay (unified mycli style; click toggles, swipe right tucks) ---
+  const STATUS_ID = "mycli-doubao-status";
   const STATUS_COLLAPSE_MS = 3000;
+  const STATUS_PEEK_PX = 18;
+  const STATUS_SWIPE_PX = 48;
+  const STATUS_BOX_CSS = [
+    "position:fixed",
+    "right:0",
+    "top:72px",
+    "z-index:2147483647",
+    "background:rgba(17,24,39,.92)",
+    "color:#fff",
+    "font:12px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "padding:8px 10px",
+    "border-radius:10px 0 0 10px",
+    "border-left:3px solid #3b82f6",
+    "box-shadow:0 8px 24px rgba(0,0,0,.18)",
+    "max-width:320px",
+    "white-space:pre-wrap",
+    "cursor:pointer",
+    "user-select:none",
+    "touch-action:none",
+    "transition:transform .25s ease, opacity .25s ease",
+  ].join(";");
   let statusCollapsed = false;
   let statusCollapseTimer = null;
   let statusBox = null;
 
-  function renderStatus() {
+  function applyStatusTransform() {
     if (!statusBox) return;
     if (statusCollapsed) {
-      statusBox.textContent = "\u2261"; // collapsed handle: ≡
-      statusBox.style.transform = "translateX(14px)";
-      statusBox.style.opacity = "0.6";
+      statusBox.style.transform = `translateX(calc(100% - ${STATUS_PEEK_PX}px))`;
+      statusBox.style.opacity = "0.7";
     } else {
-      statusBox.textContent = statusBox.dataset.full || "";
       statusBox.style.transform = "none";
       statusBox.style.opacity = "1";
     }
+  }
+
+  function renderStatus() {
+    if (!statusBox) return;
+    statusBox.textContent = statusBox.dataset.full || "";
+    applyStatusTransform();
   }
 
   function collapseStatus() {
@@ -93,36 +119,96 @@
     clearTimeout(statusCollapseTimer);
     statusCollapseTimer = setTimeout(collapseStatus, STATUS_COLLAPSE_MS);
   }
-  function setStatus(text) {
-    lastStatus = text;
-    let box = document.getElementById("mycli-doubao-status");
-    if (!box) {
-      box = document.createElement("div");
-      box.id = "mycli-doubao-status";
-      box.style.cssText = [
-        "position:fixed",
-        "right:14px",
-        "top:14px",
-        "z-index:2147483647",
-        "background:#111827",
-        "color:#fff",
-        "font:12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
-        "padding:8px 10px",
-        "border-radius:8px",
-        "box-shadow:0 8px 24px rgba(0,0,0,.18)",
-        "max-width:260px",
-        "white-space:pre-wrap",
-        "cursor:pointer",
-        "user-select:none",
-        "transition:opacity .2s ease, transform .2s ease",
-      ].join(";");
-      document.documentElement.appendChild(box);
-    }
-    statusBox = box;
-    box.onclick = () => {
+
+  function attachStatusGestures(box) {
+    let suppressClick = false;
+
+    box.addEventListener("click", () => {
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
       if (statusCollapsed) expandStatus();
       else collapseStatus();
+    });
+
+    // Two-finger trackpad swipe right tucks the box away, like a macOS notification.
+    let wheelAccum = 0;
+    let wheelResetTimer = null;
+    box.addEventListener("wheel", (event) => {
+      if (statusCollapsed || Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;
+      event.preventDefault();
+      wheelAccum = Math.max(0, wheelAccum + event.deltaX);
+      clearTimeout(wheelResetTimer);
+      if (wheelAccum >= STATUS_SWIPE_PX) {
+        wheelAccum = 0;
+        collapseStatus();
+        return;
+      }
+      box.style.transform = `translateX(${wheelAccum}px)`;
+      wheelResetTimer = setTimeout(() => {
+        wheelAccum = 0;
+        applyStatusTransform();
+      }, 250);
+    }, { passive: false });
+
+    // Dragging the box to the right also tucks it away.
+    let dragPointerId = null;
+    let dragStartX = 0;
+    let dragDx = 0;
+    const endStatusDrag = (event) => {
+      if (dragPointerId !== event.pointerId) return;
+      dragPointerId = null;
+      box.style.transition = "transform .25s ease, opacity .25s ease";
+      if (dragDx > 4) suppressClick = true;
+      if (dragDx >= STATUS_SWIPE_PX) collapseStatus();
+      else applyStatusTransform();
+      dragDx = 0;
     };
+    box.addEventListener("pointerdown", (event) => {
+      if (statusCollapsed || event.button !== 0) return;
+      dragPointerId = event.pointerId;
+      dragStartX = event.clientX;
+      dragDx = 0;
+    });
+    box.addEventListener("pointermove", (event) => {
+      if (dragPointerId !== event.pointerId) return;
+      dragDx = event.clientX - dragStartX;
+      if (dragDx > 4) {
+        try { box.setPointerCapture(event.pointerId); } catch {}
+        box.style.transition = "none";
+        box.style.transform = `translateX(${dragDx}px)`;
+      }
+    });
+    box.addEventListener("pointerup", endStatusDrag);
+    box.addEventListener("pointercancel", endStatusDrag);
+  }
+
+  function ensureStatusBox() {
+    if (statusBox) return statusBox;
+    let box = document.getElementById(STATUS_ID);
+    if (!box) {
+      box = document.createElement("div");
+      box.id = STATUS_ID;
+      box.style.cssText = STATUS_BOX_CSS;
+      attachStatusGestures(box);
+      const mountStatusBox = () => {
+        const target = document.body || document.documentElement || document.head;
+        if (!target) {
+          requestAnimationFrame(mountStatusBox);
+          return;
+        }
+        target.appendChild(box);
+      };
+      mountStatusBox();
+    }
+    statusBox = box;
+    return box;
+  }
+
+  function setStatus(text) {
+    lastStatus = text;
+    const box = ensureStatusBox();
     box.dataset.full = `mycli/${SITE} ${VERSION}\n${text}`;
     expandStatus();
   }
@@ -545,7 +631,7 @@
     const candidates = selectors.flatMap((selector) => [...document.querySelectorAll(selector)]);
     return candidates
       .filter(visible)
-      .filter((element) => !element.closest("#doubao-ear-status"))
+      .filter((element) => !element.closest(`#${STATUS_ID}`))
       .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
   }
 
@@ -563,7 +649,7 @@
   function clickableElements() {
     return [...document.querySelectorAll("button, [role='button'], [role='menuitem'], label, li, div")]
       .filter(visible)
-      .filter((element) => !element.closest("#doubao-ear-status"));
+      .filter((element) => !element.closest(`#${STATUS_ID}`));
   }
 
   function findClickableByText(pattern) {
@@ -578,15 +664,34 @@
   }
 
   function findPlusButton(input) {
+    const inputRect = input.getBoundingClientRect();
+    const iconButton = [...document.querySelectorAll("button, [role='button']")]
+      .filter(isClickable)
+      .filter((element) => !element.closest("nav"))
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const text = buttonText(element) || shortVisibleText(element);
+        return (
+          rect.width >= 24 &&
+          rect.width <= 56 &&
+          rect.height >= 24 &&
+          rect.height <= 56 &&
+          Math.abs(rect.bottom - (inputRect.bottom + 50)) < 90 &&
+          rect.right <= inputRect.left + 90 &&
+          text.length < 20
+        );
+      })
+      .sort((a, b) => centerDistance(a, inputRect) - centerDistance(b, inputRect))[0];
+    if (iconButton) return iconButton;
+
     const buttons = clickableElements().filter((element) => {
       const text = buttonText(element) || shortVisibleText(element);
       return /^(\+|添加|更多|上传)$/.test(text) || /添加|上传|更多/.test(text);
     });
-    const inputRect = input.getBoundingClientRect();
     const nearInput = buttons
       .filter((button) => {
         const rect = button.getBoundingClientRect();
-        return Math.abs(rect.bottom - inputRect.bottom) < 140 && rect.right < inputRect.right;
+        return !button.closest("nav") && Math.abs(rect.bottom - inputRect.bottom) < 140 && rect.right < inputRect.right;
       })
       .sort((a, b) => centerDistance(a, inputRect) - centerDistance(b, inputRect))[0];
     return nearInput || buttons[0];
@@ -602,7 +707,17 @@
     return null;
   }
 
+  function podcastComposerLabelActive(text) {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    return /输入主题.*网页.*文档/.test(normalized) || /输入主题.*添加网页.*文档/.test(normalized);
+  }
+
   function podcastModeSelected(input) {
+    const inputText = (buttonText(input) || shortVisibleText(input) || "").replace(/\s+/g, " ").trim();
+    if (podcastComposerLabelActive(inputText)) {
+      return true;
+    }
+
     const inputRect = input.getBoundingClientRect();
     return clickableElements().some((element) => {
       const text = shortVisibleText(element);
@@ -664,12 +779,16 @@
       await new Promise((resolve) => setTimeout(resolve, 250));
       if (podcastModeSelected(input)) return;
     }
-    throw new Error("AI podcast mode did not become active");
+    const inputText = (buttonText(input) || shortVisibleText(input) || "").replace(/\s+/g, " ").trim();
+    throw new Error(`AI podcast mode did not become active (input=${JSON.stringify(inputText)})`);
   }
 
   async function openUploadMenu(input) {
     let uploadButton = findClickableByText(/上传文件/);
-    if (uploadButton) return uploadButton;
+    if (uploadButton) {
+      uploadButton.click();
+      return uploadButton;
+    }
 
     const plusButton = findPlusButton(input);
     if (!plusButton) {
@@ -677,10 +796,10 @@
     }
     plusButton.click();
     uploadButton = await waitForClickableText(/上传文件/, 5000);
-    if (!uploadButton) {
-      throw new Error("Could not find upload file button");
+    if (uploadButton) {
+      uploadButton.click();
     }
-    return uploadButton;
+    return uploadButton || null;
   }
 
   async function attachmentToFile(attachment) {
@@ -698,6 +817,28 @@
     input.files = dataTransfer.files;
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function findUploadFileInput() {
+    const inputs = [...document.querySelectorAll("input[type='file']")];
+    return (
+      inputs.find((item) => {
+        const accept = String(item.getAttribute("accept") || "").toLowerCase();
+        return item.multiple || /png|jpg|jpeg|webp|pdf|doc|xls|ppt|txt|md/.test(accept);
+      }) ||
+      inputs.at(-1) ||
+      null
+    );
+  }
+
+  async function waitForUploadFileInput(timeoutMs = 3000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const input = findUploadFileInput();
+      if (input) return input;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return findUploadFileInput();
   }
 
   function uploadRegion(input) {
@@ -746,13 +887,16 @@
       files.push(await attachmentToFile(attachment));
     }
 
-    const beforeInputs = new Set([...document.querySelectorAll("input[type='file']")]);
-    await openUploadMenu(input);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    let fileInput = await waitForUploadFileInput(1500);
+    if (!fileInput) {
+      const beforeInputs = new Set([...document.querySelectorAll("input[type='file']")]);
+      await openUploadMenu(input);
+      await new Promise((resolve) => setTimeout(resolve, 300));
 
-    const fileInput =
-      [...document.querySelectorAll("input[type='file']")].find((item) => !beforeInputs.has(item)) ||
-      [...document.querySelectorAll("input[type='file']")].at(-1);
+      fileInput =
+        [...document.querySelectorAll("input[type='file']")].find((item) => !beforeInputs.has(item)) ||
+        (await waitForUploadFileInput(3000));
+    }
     if (!fileInput) {
       throw new Error("Could not find file upload input");
     }
@@ -766,6 +910,7 @@
     return [
       button.getAttribute("aria-label"),
       button.getAttribute("title"),
+      button.getAttribute("placeholder"),
       button.textContent,
       button.getAttribute("data-testid"),
     ]
@@ -1064,12 +1209,33 @@
     return new Blob([bytes], { type: "audio/wav" });
   }
 
+  function selectReadAudioSource(chunks, pcmChunks) {
+    if (pcmChunks.length) return "pcm";
+    if (chunks.length) return "encoded";
+    return "none";
+  }
+
+  function readAudioCaptureSummary(source = selectReadAudioSource(readAudioCapture.chunks, readAudioCapture.pcmChunks)) {
+    return [
+      `source=${source}`,
+      `encoded_chunks=${readAudioCapture.chunks.length}`,
+      `encoded_bytes=${readAudioCapture.encodedBytes}`,
+      `pcm_chunks=${readAudioCapture.pcmChunks.length}`,
+      `pcm_bytes=${readAudioCapture.pcmBytes}`,
+      `sample_rate=${readAudioCapture.sampleRate || 0}`,
+    ].join(" ");
+  }
+
   function blobFromReadAudioChunks() {
     const chunks = readAudioCapture.chunks.slice();
     const pcmChunks = readAudioCapture.pcmChunks.slice();
-    if (!chunks.length && !pcmChunks.length) throw new Error("No read-aloud audio was captured");
+    const source = selectReadAudioSource(chunks, pcmChunks);
+    if (source === "none") throw new Error("No read-aloud audio was captured");
 
-    if (!chunks.length && pcmChunks.length) {
+    // The PCM tap reflects what actually reached the output device, so keep
+    // it when both taps captured data and only fall back to encoded chunks
+    // when PCM was unavailable.
+    if (source === "pcm") {
       return wavBlobFromFloat32Chunks(pcmChunks, readAudioCapture.sampleRate || 24000);
     }
 
@@ -1301,12 +1467,16 @@
   }
 
   async function saveReadAudio(jobId) {
+    const source = selectReadAudioSource(readAudioCapture.chunks, readAudioCapture.pcmChunks);
+    const captureSummary = readAudioCaptureSummary(source);
     const blob = blobFromReadAudioChunks();
     const extension = extensionFromBlob(blob) || "wav";
     const filename = `doubao-read-${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`;
     setStatus(`saving read audio\n${filename}`);
+    sendWs({ type: "log", level: "info", msg: `[read ${jobId.slice(0, 8)}] saving ${filename} ${captureSummary}` });
     const result = await uploadToLocalService(jobId, filename, blob);
-    return { size: blob.size, savedPath: result.path };
+    sendWs({ type: "log", level: "info", msg: `[read ${jobId.slice(0, 8)}] saved ${result.path} bytes=${blob.size} ${captureSummary}` });
+    return { size: blob.size, savedPath: result.path, source, captureSummary };
   }
 
   async function clickReadAloudAndSave(prompt, jobId, timeoutMs) {
@@ -1329,7 +1499,14 @@
       while (Date.now() - started < totalTimeoutMs) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         becomeWorker();
-        if (readAudioCapture.error) throw new Error(readAudioCapture.error);
+        if (readAudioCapture.error) {
+          sendWs({
+            type: "log",
+            level: "warn",
+            msg: `[read ${jobId.slice(0, 8)}] capture error ${readAudioCapture.error} ${readAudioCaptureSummary()}`,
+          });
+          throw new Error(readAudioCapture.error);
+        }
 
         const chunkCount = readAudioCapture.chunks.length + readAudioCapture.pcmChunks.length;
         if (chunkCount !== lastChunkCount) {
@@ -1365,6 +1542,11 @@
       stopReadAudioCapture();
     }
 
+    sendWs({
+      type: "log",
+      level: "warn",
+      msg: `[read ${jobId.slice(0, 8)}] timeout waiting for audio ${readAudioCaptureSummary()}`,
+    });
     throw new Error(`Timed out waiting for read-aloud audio (chunks=${readAudioCapture.chunks.length + readAudioCapture.pcmChunks.length})`);
   }
 

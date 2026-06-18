@@ -66,6 +66,7 @@ function usage() {
   lines.push("  mycli doubao read --file ./file.md --out-dir ./audio");
   lines.push("  mycli doubao podcast --file ./material.pdf");
   lines.push("  mycli bilibili recent 402626075 123456789 --days 7 --limit 3");
+  lines.push("  mycli bilibili sell items.json --account 账号昵称   # 多账号时指定页面");
   lines.push("");
   lines.push("Install the Tampermonkey userscript:");
   for (const site of sites) {
@@ -88,8 +89,12 @@ async function runSiteCommand(site, command, options, positional) {
     process.exitCode = 1;
     return;
   }
+  // Every site command accepts --account to pick one of several connected
+  // pages (e.g. two Bilibili tabs logged in to different accounts).
+  const account = options.account && options.account !== true ? String(options.account) : undefined;
+  const boundSendCommand = (payload) => sendCommand({ account, ...payload });
   try {
-    await spec.run({ options, positional, sendCommand, site, action: command });
+    await spec.run({ options, positional, sendCommand: boundSendCommand, site, action: command });
   } catch (error) {
     console.error(error.message || String(error));
     process.exitCode = 1;
@@ -131,7 +136,8 @@ async function daemonSubcommand(sub) {
     } else {
       console.log("connected sites:");
       for (const entry of data.sites) {
-        console.log(`  ${entry.site} v${entry.version || "?"}  pending=${entry.pending}`);
+        const account = entry.accountName || entry.accountId;
+        console.log(`  ${entry.site} v${entry.version || "?"}${account ? `  account=${account}` : ""}  pending=${entry.pending}`);
       }
     }
     console.log(`log: ${LOG_PATH}`);
@@ -172,7 +178,7 @@ async function main() {
 
   const [first, second, ...rest] = argv;
 
-  if (first === "daemon") {
+  if (first === "daemon" || first === "deamon") {
     return daemonSubcommand(second);
   }
 
