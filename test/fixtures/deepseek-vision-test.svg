@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <rect width="640" height="360" fill="#ffffff"/>
+  <rect x="24" y="24" width="592" height="312" rx="24" fill="#e8f0ff" stroke="#2457d6" stroke-width="8"/>
+  <text x="320" y="190" text-anchor="middle" font-family="Arial, sans-serif" font-size="64" font-weight="700" fill="#173a8f">VISION_OK</text>
+</svg>
