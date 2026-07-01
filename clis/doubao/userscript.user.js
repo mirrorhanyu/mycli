@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.5.18
+// @version      0.5.19
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,8 +24,19 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.5.18";
-  const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const VERSION = "0.5.19";
+  const TAB_ID_KEY = "mycli-doubao-tab-id";
+  const TAB_ID = (() => {
+    try {
+      const existing = sessionStorage.getItem(TAB_ID_KEY);
+      if (existing) return existing;
+      const generated = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      sessionStorage.setItem(TAB_ID_KEY, generated);
+      return generated;
+    } catch {
+      return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+  })();
   const LOCK_KEY = "mycli-doubao-worker-lock";
   const LOCK_TTL_MS = 5000;
   const RECONNECT_MIN_MS = 1000;
@@ -62,6 +73,7 @@
   let ws = null;
   let reconnectTimer = null;
   let reconnectDelay = RECONNECT_MIN_MS;
+  let standby = false;
 
   // --- Status overlay (unified mycli style; click toggles, swipe right tucks) ---
   const STATUS_ID = "mycli-doubao-status";
@@ -629,8 +641,12 @@
       "[role='textbox']",
     ];
     const candidates = selectors.flatMap((selector) => [...document.querySelectorAll(selector)]);
-    return candidates
+    const filtered = candidates
       .filter(visible)
+      .filter((element) => !element.closest(`#${STATUS_ID}`))
+      .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
+    if (filtered) return filtered;
+    return candidates
       .filter((element) => !element.closest(`#${STATUS_ID}`))
       .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
   }
@@ -1693,16 +1709,23 @@
     }, delay);
   }
 
+  function scheduleStandbyRetry() {
+    if (reconnectTimer) return;
+    reconnectDelay = RECONNECT_MIN_MS;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      standby = false;
+      connect();
+    }, LOCK_TTL_MS);
+  }
+
   function connect() {
     if (!becomeWorker()) {
       if (lastStatus !== "standby, another tab is worker") {
         setStatus("standby, another tab is worker");
       }
       // Re-check periodically in case the worker tab dies.
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connect();
-      }, LOCK_TTL_MS);
+      scheduleStandbyRetry();
       return;
     }
 
@@ -1716,6 +1739,7 @@
 
     ws.addEventListener("open", () => {
       reconnectDelay = RECONNECT_MIN_MS;
+      standby = false;
       setStatus("connected, waiting");
       sendWs({ type: "hello", site: SITE, version: VERSION, contextId: TAB_ID });
     });
@@ -1728,11 +1752,25 @@
         handleCommand(msg);
       } else if (msg.type === "hello_ack") {
         // noop
+      } else if (msg.type === "hello_rejected") {
+        standby = true;
+        releaseWorker();
+        setStatus("standby, another page is connected");
+        try { ws && ws.close(); } catch {}
+      } else if (msg.type === "superseded") {
+        standby = true;
+        releaseWorker();
+        setStatus("superseded by another page");
+        try { ws && ws.close(); } catch {}
       }
     });
 
     ws.addEventListener("close", () => {
       ws = null;
+      if (standby) {
+        scheduleStandbyRetry();
+        return;
+      }
       if (!busy) setStatus("disconnected");
       scheduleReconnect();
     });

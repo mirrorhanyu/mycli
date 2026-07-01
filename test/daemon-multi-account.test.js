@@ -154,12 +154,87 @@ test("duplicate page for the same account is rejected, takeover supersedes", asy
   assert.deepStrictEqual(afterTakeover.result, { from: "alice2" });
 });
 
-test("legacy sites without account ids keep last-writer-wins", async () => {
+test("legacy sites without account ids reject duplicate pages without kicking the worker", async () => {
   const tab1 = await openPeer({ site: "toutiao" });
   assert.strictEqual((await tab1.next()).type, "hello_ack");
   const tab2 = await openPeer({ site: "toutiao" });
-  assert.strictEqual((await tab2.next()).type, "hello_ack");
-  const superseded = await tab1.next();
-  assert.strictEqual(superseded.type, "superseded");
-  await waitFor(() => tab1.isClosed(), 3000, "superseded legacy peer close");
+  const rejected = await tab2.next();
+  assert.strictEqual(rejected.type, "hello_rejected");
+  assert.strictEqual(rejected.reason, "site_in_use");
+  await waitFor(() => tab2.isClosed(), 3000, "rejected legacy peer close");
+  assert.strictEqual(tab1.isClosed(), false);
+
+  tab1.replyTo(() => ({ from: "toutiao-1" }));
+  const result = await sendCommand({ site: "toutiao", action: "noop", args: {} });
+  assert.deepStrictEqual(result.result, { from: "toutiao-1" });
+});
+
+test("different legacy sites coexist", async () => {
+  const deepseek = await openPeer({ site: "deepseek" });
+  const doubao = await openPeer({ site: "doubao" });
+  assert.strictEqual((await deepseek.next()).type, "hello_ack");
+  assert.strictEqual((await doubao.next()).type, "hello_ack");
+  assert.strictEqual(deepseek.isClosed(), false);
+  assert.strictEqual(doubao.isClosed(), false);
+});
+
+test("HTTP polling bridge dispatches commands and accepts results", async () => {
+  const contextId = "chatgpt-http-test";
+  const register = await fetch(`${API}/bridge/poll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ site: "chatgpt", version: "test", contextId }),
+  }).then((res) => res.json());
+  assert.strictEqual(register.ok, true);
+  assert.strictEqual(register.connected, true);
+
+  const duplicate = await fetch(`${API}/bridge/poll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      site: "chatgpt",
+      version: "test",
+      contextId: "chatgpt-http-duplicate",
+    }),
+  }).then((res) => res.json());
+  assert.strictEqual(duplicate.ok, false);
+  assert.match(duplicate.error, /Another active page/);
+
+  await waitFor(async () => {
+    const status = await (await fetch(`${API}/status`)).json();
+    return status.sites.some((site) => site.site === "chatgpt" && site.transport === "http");
+  }, 3000, "HTTP bridge registration");
+
+  const poll = fetch(`${API}/bridge/poll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ site: "chatgpt", version: "test", contextId }),
+  }).then((res) => res.json());
+  const commandResult = sendCommand({
+    site: "chatgpt",
+    action: "image",
+    args: { prompt: "test" },
+  });
+  const polled = await poll;
+  assert.strictEqual(polled.ok, true);
+  assert.strictEqual(polled.command.action, "image");
+  assert.strictEqual(polled.command.args.prompt, "test");
+
+  const resultResponse = await fetch(`${API}/bridge/result`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      site: "chatgpt",
+      contextId,
+      id: polled.command.id,
+      ok: true,
+      data: { images: [{ url: "https://example.test/image.png" }] },
+    }),
+  });
+  assert.strictEqual(resultResponse.ok, true);
+  const completed = await commandResult;
+  assert.strictEqual(completed.ok, true);
+  assert.deepStrictEqual(completed.result, {
+    images: [{ url: "https://example.test/image.png" }],
+  });
 });

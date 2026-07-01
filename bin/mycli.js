@@ -63,6 +63,8 @@ function usage() {
   lines.push("Examples:");
   lines.push('  mycli doubao ask --text "3+2 等于多少"');
   lines.push('  mycli doubao ask --text "识别图片" --attach a.png --attach b.png');
+  lines.push('  mycli chatgpt image "a watercolor cat" --mode High --rename cat.png');
+  lines.push("  mycli chatgpt image --file prompt.md --mode Medium --out-dir ./images");
   lines.push("  mycli doubao read --file ./file.md --out-dir ./audio");
   lines.push("  mycli doubao podcast --file ./material.pdf");
   lines.push("  mycli bilibili recent 402626075 123456789 --days 7 --limit 3");

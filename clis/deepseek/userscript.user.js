@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli DeepSeek Bridge
 // @namespace    local.mycli.deepseek
-// @version      0.1.3
+// @version      0.1.4
 // @description  WebSocket bridge to the mycli micro-daemon. Drives the logged-in DeepSeek web UI.
 // @match        https://chat.deepseek.com/*
 // @downloadURL  http://127.0.0.1:17872/userscript/deepseek/mycli.user.js
@@ -18,7 +18,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "deepseek";
-  const VERSION = "0.1.3";
+  const VERSION = "0.1.4";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const LOCK_KEY = "mycli-deepseek-worker-lock";
   const LOCK_TTL_MS = 5000;
@@ -38,6 +38,7 @@
   let reconnectTimer = null;
   let reconnectDelay = RECONNECT_MIN_MS;
   let lastStatus = "";
+  let standby = false;
 
   const STATUS_ID = "mycli-deepseek-status";
   const STATUS_COLLAPSE_MS = 3000;
@@ -593,15 +594,22 @@
     }, delay);
   }
 
+  function scheduleStandbyRetry() {
+    if (reconnectTimer) return;
+    reconnectDelay = RECONNECT_MIN_MS;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      standby = false;
+      connect();
+    }, LOCK_TTL_MS);
+  }
+
   function connect() {
     if (!becomeWorker()) {
       if (lastStatus !== "standby, another tab is worker") {
         setStatus("standby, another tab is worker");
       }
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connect();
-      }, LOCK_TTL_MS);
+      scheduleStandbyRetry();
       return;
     }
 
@@ -615,6 +623,7 @@
 
     ws.addEventListener("open", () => {
       reconnectDelay = RECONNECT_MIN_MS;
+      standby = false;
       setStatus("connected, waiting");
       sendWs({ type: "hello", site: SITE, version: VERSION, contextId: TAB_ID });
     });
@@ -629,11 +638,25 @@
       if (message.type === "command") {
         becomeWorker();
         handleCommand(message);
+      } else if (message.type === "hello_rejected") {
+        standby = true;
+        releaseWorker();
+        setStatus("standby, another page is connected");
+        try { ws && ws.close(); } catch {}
+      } else if (message.type === "superseded") {
+        standby = true;
+        releaseWorker();
+        setStatus("superseded by another page");
+        try { ws && ws.close(); } catch {}
       }
     });
 
     ws.addEventListener("close", () => {
       ws = null;
+      if (standby) {
+        scheduleStandbyRetry();
+        return;
+      }
       if (!busy) setStatus("disconnected");
       scheduleReconnect();
     });

@@ -37,6 +37,8 @@ npm link        # so `mycli` is on your PATH
 mycli doubao ask --text "3+2 等于多少"
 mycli doubao ask --file ./prompts.md > result.md
 mycli doubao ask --text "按顺序识别这些图片" --attach ./7.png --attach ./8.png --attach ./9.png
+mycli chatgpt image "a watercolor cat" --mode High --rename cat.png
+mycli chatgpt image --file ./prompt.md --mode Medium --out-dir ./images
 mycli doubao read --file ./file.md --out-dir ./audio
 mycli doubao podcast --file ./material.pdf --out-dir ./audio
 mycli bilibili recent 402626075 123456789 --days 7 --limit 3
@@ -49,6 +51,14 @@ For `mycli doubao ask`:
 - `--file` means "read the prompt text from this file".
 - `--attach` / `--attachment` adds an attachment and can be repeated.
 - Attachment order follows the command-line order exactly.
+
+For `mycli chatgpt image`:
+- The prompt can be positional text, `--text`, or `--file`.
+- `--mode` accepts `Instant`, `Medium`, or `High` and defaults to `High`.
+- Generated PNG files are downloaded to `~/Downloads` by default.
+- `--out-dir <dir>` changes the download directory.
+- `--rename <filename>` sets the saved filename.
+- `--no-download` prints the generated image URL without saving it.
 
 ```sh
 mycli daemon start | stop | restart | status | logs
@@ -123,6 +133,9 @@ WebSocket (daemon ↔ userscript at `/ws`):
 - `→ {type:"result", id, ok:true, data}` or `{type:"result", id, ok:false, error}`
 - `→ {type:"log", level, msg}` (optional)
 - ping/pong heartbeat every 15s
+
+ChatGPT uses `POST /bridge/poll` and `POST /bridge/result` as an HTTP fallback
+because the ChatGPT page blocks localhost WebSocket connections.
 
 ## State
 

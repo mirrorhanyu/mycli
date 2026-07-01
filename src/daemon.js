@@ -17,6 +17,8 @@ const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 const MAX_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024;
 const DOWNLOAD_DIR = path.join(os.homedir(), "Downloads");
 const HEARTBEAT_MS = 15000;
+const HTTP_PEER_TTL_MS = 45000;
+const HTTP_POLL_MS = 25000;
 
 // site -> Map(accountKey -> { ws, version, contextId, accountId, accountName, lastSeenAt })
 // accountKey is the userscript-reported accountId, or "" for sites that do not
@@ -97,7 +99,16 @@ function livePeers(site) {
   const peers = sitePeers.get(site);
   if (!peers) return [];
   for (const [key, entry] of peers) {
-    if (entry.ws.readyState !== WebSocket.OPEN) peers.delete(key);
+    const live = entry.transport === "http"
+      ? Date.now() - entry.lastSeenAt < HTTP_PEER_TTL_MS
+      : entry.ws?.readyState === WebSocket.OPEN;
+    if (!live) {
+      if (entry.poll) {
+        clearTimeout(entry.poll.timer);
+        try { sendJson(entry.poll.req, entry.poll.res, 409, { ok: false, error: "HTTP bridge expired" }); } catch {}
+      }
+      peers.delete(key);
+    }
   }
   return [...peers.entries()];
 }
@@ -254,14 +265,26 @@ function dispatchCommand({ site, account, action, args, timeoutMs }) {
       }));
     }
 
+    const message = { type: "command", id, action, args: wireArgs };
     try {
-      peer.ws.send(JSON.stringify({ type: "command", id, action, args: wireArgs }), (err) => {
-        if (err && !entry.dispatched) {
-          clearTimeout(timer);
-          pending.delete(id);
-          reject(new Error(`Failed to dispatch: ${err.message}`));
+      if (peer.transport === "http") {
+        if (peer.poll) {
+          const poll = peer.poll;
+          peer.poll = null;
+          clearTimeout(poll.timer);
+          sendJson(poll.req, poll.res, 200, { ok: true, command: message });
+        } else {
+          peer.queue.push(message);
         }
-      });
+      } else {
+        peer.ws.send(JSON.stringify(message), (err) => {
+          if (err && !entry.dispatched) {
+            clearTimeout(timer);
+            pending.delete(id);
+            reject(new Error(`Failed to dispatch: ${err.message}`));
+          }
+        });
+      }
       entry.dispatched = true;
     } catch (error) {
       clearTimeout(timer);
@@ -269,6 +292,142 @@ function dispatchCommand({ site, account, action, args, timeoutMs }) {
       reject(error);
     }
   });
+}
+
+function compareVersions(left, right) {
+  const a = String(left || "").split(".").map((part) => Number(part) || 0);
+  const b = String(right || "").split(".").map((part) => Number(part) || 0);
+  const length = Math.max(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (a[index] || 0) - (b[index] || 0);
+    if (difference) return difference;
+  }
+  return 0;
+}
+
+function registerHttpPeer(payload) {
+  const site = String(payload.site || "").trim();
+  const contextId = String(payload.contextId || "").trim();
+  if (!site || !contextId) throw new Error("Missing site or contextId");
+  const accountId = payload.accountId ? String(payload.accountId) : "";
+  const accountKey = accountId;
+  const peers = sitePeerMap(site);
+  const previous = peers.get(accountKey);
+
+  if (previous?.transport === "http" && previous.contextId === contextId) {
+    previous.lastSeenAt = Date.now();
+    previous.version = payload.version || previous.version || null;
+    return { site, accountKey, peer: previous, created: false };
+  }
+
+  if (previous) {
+    const previousLive = previous.transport === "http"
+      ? Date.now() - previous.lastSeenAt < HTTP_PEER_TTL_MS
+      : previous.ws?.readyState === WebSocket.OPEN;
+    const newerHttpPeer =
+      previous.transport === "http" &&
+      compareVersions(payload.version, previous.version) > 0;
+    if (previousLive && !newerHttpPeer) {
+      throw new Error(
+        `Another active page already serves ${site}${previous.version ? ` v${previous.version}` : ""}`,
+      );
+    }
+    if (previous.transport === "http" && previous.poll) {
+      clearTimeout(previous.poll.timer);
+      try {
+        sendJson(previous.poll.req, previous.poll.res, 409, {
+          ok: false,
+          error: "HTTP bridge superseded by another page",
+        });
+      } catch {}
+    } else if (previous.ws?.readyState === WebSocket.OPEN) {
+      try { previous.ws.send(JSON.stringify({ type: "superseded", site })); } catch {}
+      try { previous.ws.close(); } catch {}
+    }
+    failAllForPeer(site, accountKey, "Userscript superseded by another page");
+  }
+
+  const peer = {
+    transport: "http",
+    version: payload.version || null,
+    contextId,
+    accountId: accountId || null,
+    accountName: payload.accountName ? String(payload.accountName) : null,
+    lastSeenAt: Date.now(),
+    queue: [],
+    poll: null,
+  };
+  peers.set(accountKey, peer);
+  log(`[http] site registered: ${site}${accountId ? ` account=${peer.accountName || accountId}` : ""} v${peer.version || "?"}`);
+  return { site, accountKey, peer, created: true };
+}
+
+function takeQueuedCommand(peer) {
+  while (peer.queue.length) {
+    const command = peer.queue.shift();
+    if (pending.has(command.id)) return command;
+  }
+  return null;
+}
+
+function handleHttpPoll(req, res, payload) {
+  let registration;
+  try {
+    registration = registerHttpPeer(payload);
+  } catch (error) {
+    sendJson(req, res, 400, { ok: false, error: error.message });
+    return;
+  }
+  const { peer, created } = registration;
+  if (created) {
+    sendJson(req, res, 200, { ok: true, connected: true, command: null });
+    return;
+  }
+  const command = takeQueuedCommand(peer);
+  if (command) {
+    sendJson(req, res, 200, { ok: true, command });
+    return;
+  }
+
+  if (peer.poll) {
+    clearTimeout(peer.poll.timer);
+    try { sendJson(peer.poll.req, peer.poll.res, 409, { ok: false, error: "Poll replaced" }); } catch {}
+  }
+  const poll = { req, res, timer: null };
+  peer.poll = poll;
+  poll.timer = setTimeout(() => {
+    if (peer.poll !== poll) return;
+    peer.poll = null;
+    peer.lastSeenAt = Date.now();
+    sendJson(req, res, 200, { ok: true, command: null });
+  }, HTTP_POLL_MS);
+  req.on("close", () => {
+    if (peer.poll !== poll) return;
+    clearTimeout(poll.timer);
+    peer.poll = null;
+  });
+}
+
+function handleBridgeResult(req, res, payload) {
+  const site = String(payload.site || "").trim();
+  const contextId = String(payload.contextId || "").trim();
+  const id = String(payload.id || "").trim();
+  const peer = sitePeers.get(site)?.get(payload.accountId ? String(payload.accountId) : "");
+  if (!site || !contextId || !id || peer?.transport !== "http" || peer.contextId !== contextId) {
+    sendJson(req, res, 404, { ok: false, error: "Unknown HTTP bridge command" });
+    return;
+  }
+  peer.lastSeenAt = Date.now();
+  const entry = pending.get(id);
+  if (!entry) {
+    sendJson(req, res, 404, { ok: false, error: "Unknown command id" });
+    return;
+  }
+  clearTimeout(entry.timer);
+  pending.delete(id);
+  if (payload.ok === false) entry.reject(new Error(payload.error || "Command failed"));
+  else entry.resolve(payload.data === undefined ? null : payload.data);
+  sendJson(req, res, 200, { ok: true });
 }
 
 function safeFilename(name) {
@@ -395,6 +554,7 @@ async function handleRequest(req, res) {
       for (const [accountKey, entry] of livePeers(site)) {
         sites.push({
           site,
+          transport: entry.transport || "ws",
           version: entry.version,
           contextId: entry.contextId,
           accountId: entry.accountId || null,
@@ -425,6 +585,30 @@ async function handleRequest(req, res) {
   if (req.method === "POST" && pathname === "/shutdown") {
     sendJson(req, res, 200, { ok: true });
     setTimeout(shutdown, 50);
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/bridge/poll") {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(req, res, 400, { ok: false, error: `Invalid body: ${error.message}` });
+      return;
+    }
+    handleHttpPoll(req, res, body);
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/bridge/result") {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(req, res, 400, { ok: false, error: `Invalid body: ${error.message}` });
+      return;
+    }
+    handleBridgeResult(req, res, body);
     return;
   }
 
@@ -559,23 +743,54 @@ wss.on("connection", (ws, req) => {
       const accountKey = accountId;
       const peers = sitePeerMap(site);
       const previous = peers.get(accountKey);
+      if (previous && previous.contextId && msg.contextId && previous.contextId === msg.contextId) {
+        if (previous.transport === "http" && previous.poll) {
+          clearTimeout(previous.poll.timer);
+          try {
+            sendJson(previous.poll.req, previous.poll.res, 409, {
+              ok: false,
+              error: "HTTP bridge superseded by WebSocket page",
+            });
+          } catch {}
+        }
+        try { previous.ws?.close(); } catch {}
+        peers.set(accountKey, {
+          transport: "ws",
+          ws,
+          version: msg.version || null,
+          contextId: msg.contextId || null,
+          accountId: accountId || null,
+          accountName: msg.accountName ? String(msg.accountName) : null,
+          lastSeenAt: Date.now(),
+        });
+        registeredSite = site;
+        registeredAccountKey = accountKey;
+        log(`[ws] site registered: ${site}${accountId ? ` account=${msg.accountName || accountId}` : ""} v${msg.version || "?"} (reloaded)`);
+        try { ws.send(JSON.stringify({ type: "hello_ack", site })); } catch {}
+        return;
+      }
       if (previous && previous.ws !== ws) {
-        const previousAlive = previous.ws.readyState === WebSocket.OPEN;
-        if (previousAlive && accountId && msg.takeover !== true) {
+        const previousAlive = previous.transport === "http"
+          ? Date.now() - previous.lastSeenAt < HTTP_PEER_TTL_MS
+          : previous.ws?.readyState === WebSocket.OPEN;
+        if (previousAlive && msg.takeover !== true) {
           // A healthy page already serves this account. Reject the newcomer so
           // pages never steal the slot from each other automatically; the user
           // takes over explicitly from the status box (hello with takeover).
+          // Legacy sites without account ids also use this path; otherwise two
+          // tabs on different origins can endlessly supersede each other.
           try {
             ws.send(JSON.stringify({
               type: "hello_rejected",
               site,
-              reason: "account_in_use",
-              accountId,
+              reason: accountId ? "account_in_use" : "site_in_use",
+              accountId: accountId || null,
               accountName: previous.accountName || null,
+              contextId: previous.contextId || null,
             }));
           } catch {}
           try { ws.close(); } catch {}
-          log(`[ws] site ${site}: rejected duplicate page for account ${msg.accountName || accountId}`);
+          log(`[ws] site ${site}: rejected duplicate page for ${accountId ? `account ${msg.accountName || accountId}` : "legacy site slot"}`);
           return;
         }
         // Same account takeover (or legacy site without account ids): tell the
@@ -583,7 +798,7 @@ wss.on("connection", (ws, req) => {
         // the new page in an endless reconnect loop.
         if (previousAlive) {
           try {
-            previous.ws.send(JSON.stringify({
+            previous.ws?.send(JSON.stringify({
               type: "superseded",
               site,
               by: {
@@ -594,13 +809,23 @@ wss.on("connection", (ws, req) => {
             }));
           } catch {}
         }
-        try { previous.ws.close(); } catch {}
+        if (previous.transport === "http" && previous.poll) {
+          clearTimeout(previous.poll.timer);
+          try {
+            sendJson(previous.poll.req, previous.poll.res, 409, {
+              ok: false,
+              error: "HTTP bridge superseded by WebSocket page",
+            });
+          } catch {}
+        }
+        try { previous.ws?.close(); } catch {}
         failAllForPeer(site, accountKey, "Userscript superseded by another page");
         log(`[ws] site ${site}: previous peer superseded by ${msg.accountName || msg.contextId || "new peer"}`);
       }
       registeredSite = site;
       registeredAccountKey = accountKey;
       peers.set(accountKey, {
+        transport: "ws",
         ws,
         version: msg.version || null,
         contextId: msg.contextId || null,
@@ -695,7 +920,11 @@ function shutdown() {
   siteSessions.clear();
   for (const peers of sitePeers.values()) {
     for (const entry of peers.values()) {
-      try { entry.ws.close(); } catch {}
+      if (entry.poll) {
+        clearTimeout(entry.poll.timer);
+        try { sendJson(entry.poll.req, entry.poll.res, 503, { ok: false, error: "Daemon shutting down" }); } catch {}
+      }
+      try { entry.ws?.close(); } catch {}
     }
   }
   try { httpServer.close(); } catch {}
