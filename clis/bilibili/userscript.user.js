@@ -5,6 +5,7 @@
 // @description  WebSocket bridge to the mycli micro-daemon for Bilibili recent-upload and sell jobs.
 // @match        https://*.bilibili.com/*
 // @match        https://bilibili.com/*
+// @noframes
 // @downloadURL  http://127.0.0.1:17872/userscript/bilibili/mycli.user.js
 // @updateURL    http://127.0.0.1:17872/userscript/bilibili/mycli.user.js
 // @grant        GM_xmlhttpRequest
@@ -351,6 +352,14 @@
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(message));
     }
+  }
+
+  function sendSellLog(jobId, message, level = "info") {
+    sendWs({
+      type: "log",
+      level,
+      msg: `[sell ${jobId}] ${message}`,
+    });
   }
 
   function closeSocket() {
@@ -713,19 +722,29 @@
     return rows;
   }
 
-  async function distinguishUrls(items, referer) {
+  async function distinguishUrls(items, referer, logStep = null) {
     const uniqueUrls = [...new Set(items.map((item) => String(item.url || "").trim()).filter(Boolean))];
     const rowByUrl = new Map();
     const debug = [];
+    const batches = chunkUrls(uniqueUrls);
 
-    for (const batch of chunkUrls(uniqueUrls)) {
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      const batch = batches[batchIndex];
       const payload = { itemUrls: batch.join(",") };
-      const response = await postMallJson(
-        "https://mall.bilibili.com/mall-cbp/web/cmc/goods/distinguish/urls",
-        payload,
-        referer,
-      );
+      logStep?.(`distinguish ${batchIndex + 1}/${batches.length} start items=${batch.length}`);
+      let response;
+      try {
+        response = await postMallJson(
+          "https://mall.bilibili.com/mall-cbp/web/cmc/goods/distinguish/urls",
+          payload,
+          referer,
+        );
+      } catch (error) {
+        logStep?.(`distinguish ${batchIndex + 1}/${batches.length} failed: ${String(error?.message || error).slice(0, 180)}`, "error");
+        throw error;
+      }
       if (Number(response?.code || 0) !== 0) {
+        logStep?.(`distinguish ${batchIndex + 1}/${batches.length} rejected: code=${response?.code ?? "?"} message=${response?.message || ""}`.trim(), "error");
         throw new Error(`识别失败: code=${response?.code ?? "?"}, message=${response?.message || ""}`.trim());
       }
       debug.push({ batch, response });
@@ -733,6 +752,7 @@
       for (const [url, row] of batchRows.entries()) {
         rowByUrl.set(url, row);
       }
+      logStep?.(`distinguish ${batchIndex + 1}/${batches.length} done rows=${batchRows.size}`);
     }
 
     return { rowByUrl, debug };
@@ -780,12 +800,13 @@
     );
   }
 
-  async function fetchSelectionCartRows(itemIds, referer, pageSize = 100, maxPages = 20) {
+  async function fetchSelectionCartRows(itemIds, referer, pageSize = 100, maxPages = 20, logStep = null) {
     const wanted = new Set(itemIds.map((itemId) => String(itemId || "").trim()).filter(Boolean));
     const found = new Map();
     const debug = [];
 
     for (let page = 1; page <= maxPages; page += 1) {
+      logStep?.(`selection page ${page}/${maxPages} start found=${found.size}/${wanted.size}`);
       const response = await selectionCartPage(page, pageSize, referer);
       if (Number(response?.code || 0) !== 0 || response?.success !== true) {
         throw new Error(
@@ -802,6 +823,7 @@
         }
       }
       const totalCount = Number(data.total_count || 0);
+      logStep?.(`selection page ${page}/${maxPages} done rows=${rows.length} found=${found.size}/${wanted.size}`);
       if ([...wanted].every((itemId) => found.has(itemId))) break;
       if (!rows.length) break;
       if (totalCount > 0 && page * pageSize >= totalCount) break;
@@ -835,6 +857,8 @@
       throw new Error("Missing items");
     }
 
+    const jobId = String(cmd?.id || "unknown").slice(0, 8);
+    const logStep = (message, level = "info") => sendSellLog(jobId, message, level);
     const referer = String(cmd?.args?.referer || DEFAULT_SELL_REFERER);
     const skipRename = cmd?.args?.skip_rename === true;
     const normalized = items.map((item, index) => ({
@@ -848,9 +872,12 @@
       throw new Error(`Missing url for item index ${invalid.index}`);
     }
 
+    const rowLabel = (row) => `#${row.index}${row.short ? ` ${row.short}` : ""}`;
+    logStep(`start items=${normalized.length} skipRename=${skipRename}`);
     const debug = {};
-    const { rowByUrl, debug: distinguishDebug } = await distinguishUrls(normalized, referer);
+    const { rowByUrl, debug: distinguishDebug } = await distinguishUrls(normalized, referer, logStep);
     debug.distinguish = distinguishDebug;
+    logStep(`distinguish done matched=${rowByUrl.size}/${normalized.length}`);
 
     const results = normalized.map((item) => {
       const distinguished = rowByUrl.get(item.url);
@@ -878,8 +905,11 @@
     });
 
     debug.add = [];
-    for (const row of results) {
-      if (!row.item_id || !row.distinguish_raw) continue;
+    const addRows = results.filter((row) => row.item_id && row.distinguish_raw);
+    logStep(`add start items=${addRows.length}`);
+    for (let addIndex = 0; addIndex < addRows.length; addIndex += 1) {
+      const row = addRows[addIndex];
+      logStep(`add ${addIndex + 1}/${addRows.length} ${rowLabel(row)} itemId=${row.item_id}`);
       try {
         const response = await addGoodToSelectionCart(row.distinguish_raw, referer);
         debug.add.push({ url: row.url, response });
@@ -887,36 +917,52 @@
         const failedInfo = infos.find((info) => Number(info?.resCode || 0) !== 0);
         if (Number(response?.code || 0) !== 0 || response?.success !== true) {
           row.add_error = `success=${response?.success} code=${response?.code} message=${response?.message || ""}`.trim();
+          logStep(`add ${addIndex + 1}/${addRows.length} failed ${rowLabel(row)}: ${row.add_error}`, "warn");
         } else if (failedInfo) {
           row.add_error = `resCode=${failedInfo?.resCode} resMsg=${failedInfo?.resMsg || ""}`.trim();
+          logStep(`add ${addIndex + 1}/${addRows.length} partial ${rowLabel(row)}: ${row.add_error}`, "warn");
+        } else {
+          logStep(`add ${addIndex + 1}/${addRows.length} done ${rowLabel(row)}`);
         }
       } catch (error) {
         row.add_error = error?.message || String(error);
+        logStep(`add ${addIndex + 1}/${addRows.length} error ${rowLabel(row)}: ${String(row.add_error).slice(0, 180)}`, "error");
       }
     }
+    logStep(`add done items=${addRows.length}`);
 
     if (!skipRename) {
       debug.rename = [];
-      for (const row of results) {
-        if (!row.item_id || !row.short) continue;
+      const renameRows = results.filter((row) => row.item_id && row.short);
+      logStep(`rename start items=${renameRows.length}`);
+      for (let renameIndex = 0; renameIndex < renameRows.length; renameIndex += 1) {
+        const row = renameRows[renameIndex];
+        logStep(`rename ${renameIndex + 1}/${renameRows.length} ${rowLabel(row)} itemId=${row.item_id}`);
         try {
           const response = await setAnotherName(row.item_id, row.short, referer);
           debug.rename.push({ url: row.url, response });
           if (response?.success === true) {
             row.rename_ok = true;
+            logStep(`rename ${renameIndex + 1}/${renameRows.length} done ${rowLabel(row)}`);
           } else {
             row.rename_error = `success=${response?.success} code=${response?.code} message=${response?.message || ""}`.trim();
+            logStep(`rename ${renameIndex + 1}/${renameRows.length} failed ${rowLabel(row)}: ${row.rename_error}`, "warn");
           }
         } catch (error) {
           row.rename_error = error?.message || String(error);
+          logStep(`rename ${renameIndex + 1}/${renameRows.length} error ${rowLabel(row)}: ${String(row.rename_error).slice(0, 180)}`, "error");
         }
       }
+      logStep(`rename done items=${renameRows.length}`);
+    } else {
+      logStep("rename skipped");
     }
 
     const itemIds = results.map((row) => row.item_id).filter(Boolean);
     if (itemIds.length) {
+      logStep(`selection start itemIds=${itemIds.length}`);
       try {
-        const { rowByItemId, debug: selectionDebug } = await fetchSelectionCartRows(itemIds, referer);
+        const { rowByItemId, debug: selectionDebug } = await fetchSelectionCartRows(itemIds, referer, 100, 20, logStep);
         debug.selection = selectionDebug;
         for (const row of results) {
           if (!row.item_id) continue;
@@ -931,24 +977,30 @@
             row.selection_error = "selection cart row has no shortUrl";
           }
         }
+        logStep(`selection done found=${rowByItemId.size}/${itemIds.length}`);
       } catch (error) {
         const message = error?.message || String(error);
+        logStep(`selection error: ${String(message).slice(0, 180)}`, "error");
         for (const row of results) {
           if (row.item_id) row.selection_error = message;
         }
       }
+    } else {
+      logStep("selection skipped: no itemIds", "warn");
     }
 
     const finalized = results.map(finalizeSellRow);
+    const summary = finalized.reduce((acc, row) => {
+      acc.total += 1;
+      if (row.status === "ok") acc.ok += 1;
+      else if (row.status === "partial") acc.partial += 1;
+      else acc.failed += 1;
+      return acc;
+    }, { total: 0, ok: 0, partial: 0, failed: 0 });
+    logStep(`done total=${summary.total} ok=${summary.ok} partial=${summary.partial} failed=${summary.failed}`);
     return {
       items: finalized,
-      summary: finalized.reduce((acc, row) => {
-        acc.total += 1;
-        if (row.status === "ok") acc.ok += 1;
-        else if (row.status === "partial") acc.partial += 1;
-        else acc.failed += 1;
-        return acc;
-      }, { total: 0, ok: 0, partial: 0, failed: 0 }),
+      summary,
       debug,
     };
   }

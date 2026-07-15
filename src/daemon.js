@@ -55,10 +55,11 @@ function sendJson(req, res, status, body, extra = {}) {
   res.end(JSON.stringify(body));
 }
 
-function sendText(req, res, status, text, type = "text/plain") {
+function sendText(req, res, status, text, type = "text/plain", extra = {}) {
   res.writeHead(status, {
     "content-type": `${type}; charset=utf-8`,
     ...corsHeaders(req),
+    ...extra,
   });
   res.end(text);
 }
@@ -450,6 +451,17 @@ function uniquePath(dir, name) {
   return target;
 }
 
+function visibleAudioCopyPath(outputDir, filename, savePath) {
+  const audioExt = new Set([".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"]);
+  const dirName = path.basename(outputDir);
+  if (!dirName.startsWith(".audio.")) return savePath;
+  if (!audioExt.has(path.extname(filename).toLowerCase())) return savePath;
+
+  const target = uniquePath(path.dirname(outputDir), filename);
+  fs.copyFileSync(savePath, target);
+  return target;
+}
+
 function handleUpload(req, res, url) {
   const cmdId = String(url.searchParams.get("cmd_id") || "").trim();
   const entry = cmdId ? pending.get(cmdId) : null;
@@ -509,6 +521,7 @@ function handleUpload(req, res, url) {
       upload.nextPart += 1;
       if (upload.nextPart === upload.parts) {
         fs.renameSync(upload.tempPath, upload.savePath);
+        upload.returnPath = visibleAudioCopyPath(outputDir, filename, upload.savePath);
         activeUploads.delete(uploadKey);
       }
     } catch (error) {
@@ -522,7 +535,7 @@ function handleUpload(req, res, url) {
       complete: upload.nextPart === upload.parts,
       part: upload.nextPart,
       parts: upload.parts,
-      path: upload.nextPart === upload.parts ? upload.savePath : null,
+      path: upload.nextPart === upload.parts ? (upload.returnPath || upload.savePath) : null,
       size: upload.size,
     });
   });
@@ -624,12 +637,19 @@ async function handleRequest(req, res) {
     if (req.method === "HEAD") {
       res.writeHead(200, {
         "content-type": "application/javascript; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+        pragma: "no-cache",
+        expires: "0",
         ...corsHeaders(req),
       });
       res.end();
       return;
     }
-    sendText(req, res, 200, fs.readFileSync(file, "utf8"), "application/javascript");
+    sendText(req, res, 200, fs.readFileSync(file, "utf8"), "application/javascript", {
+      "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+      pragma: "no-cache",
+      expires: "0",
+    });
     return;
   }
 

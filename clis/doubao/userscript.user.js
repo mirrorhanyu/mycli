@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Doubao Bridge
 // @namespace    local.mycli.doubao
-// @version      0.5.19
+// @version      0.5.30
 // @description  WebSocket bridge to the mycli micro-daemon. Drives Doubao on behalf of the CLI.
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -24,7 +24,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "doubao";
-  const VERSION = "0.5.19";
+  const VERSION = "0.5.30";
   const TAB_ID_KEY = "mycli-doubao-tab-id";
   const TAB_ID = (() => {
     try {
@@ -47,8 +47,9 @@
   const MAX_READ_CAPTURE_BYTES = 400 * 1024 * 1024;
   const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
   const STABLE_MS = 3500;
-  const READ_AUDIO_QUIET_MS = 3000;
-  const READ_AUDIO_FALLBACK_QUIET_MS = 15000;
+  const READ_AUDIO_QUIET_MS = 30000;
+  const READ_AUDIO_START_TIMEOUT_MS = 60000;
+  const READ_AUDIO_SHORT_RETRY_LIMIT = 3;
   // Doubao's markdown renderer is debounced: even after the "停止生成" button
   // disappears (network stream ended), tokens keep flushing into the DOM for
   // another 1–5 seconds. Require the "done" signal to be stable for this long
@@ -62,6 +63,7 @@
     active: false,
     chunks: [],
     pcmChunks: [],
+    seenAudioBuffers: new WeakSet(),
     sampleRate: 24000,
     startedAt: 0,
     lastChunkAt: 0,
@@ -74,6 +76,9 @@
   let reconnectTimer = null;
   let reconnectDelay = RECONNECT_MIN_MS;
   let standby = false;
+  let stopped = false;
+  const INSTANCE_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const INSTANCE_KEY = "__mycliDoubaoBridgeInstance";
 
   // --- Status overlay (unified mycli style; click toggles, swipe right tucks) ---
   const STATUS_ID = "mycli-doubao-status";
@@ -219,10 +224,36 @@
   }
 
   function setStatus(text) {
+    if (stopped) return;
     lastStatus = text;
     const box = ensureStatusBox();
     box.dataset.full = `mycli/${SITE} ${VERSION}\n${text}`;
     expandStatus();
+  }
+
+  function stopInstance() {
+    stopped = true;
+    standby = true;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    releaseWorker();
+    const socket = ws;
+    ws = null;
+    try { socket && socket.close(); } catch {}
+  }
+
+  function installInstanceGuard() {
+    try {
+      const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+      const previous = pageWindow[INSTANCE_KEY];
+      if (previous?.id && previous.id !== INSTANCE_ID && typeof previous.stop === "function") {
+        previous.stop();
+      }
+      pageWindow[INSTANCE_KEY] = {
+        id: INSTANCE_ID,
+        stop: stopInstance,
+      };
+    } catch {}
   }
 
   function requestArrayBuffer(path) {
@@ -407,6 +438,7 @@
     readAudioCapture.active = true;
     readAudioCapture.chunks = [];
     readAudioCapture.pcmChunks = [];
+    readAudioCapture.seenAudioBuffers = new WeakSet();
     readAudioCapture.sampleRate = 24000;
     readAudioCapture.startedAt = Date.now();
     readAudioCapture.lastChunkAt = 0;
@@ -446,6 +478,53 @@
     readAudioCapture.lastChunkAt = Date.now();
   }
 
+  function rememberReadAudioBuffer(audioBuffer) {
+    if (!readAudioCapture.active || !audioBuffer || readAudioCapture.seenAudioBuffers.has(audioBuffer)) return;
+    const channelCount = Math.max(1, Number(audioBuffer.numberOfChannels) || 1);
+    const length = Number(audioBuffer.length) || 0;
+    if (!length || typeof audioBuffer.getChannelData !== "function") return;
+    readAudioCapture.seenAudioBuffers.add(audioBuffer);
+    if (channelCount === 1) {
+      rememberReadPcmChunk(audioBuffer.getChannelData(0), audioBuffer.sampleRate);
+      return;
+    }
+    const mixed = new Float32Array(length);
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      const data = audioBuffer.getChannelData(channel);
+      for (let i = 0; i < length; i += 1) mixed[i] += data[i] / channelCount;
+    }
+    rememberReadPcmChunk(mixed, audioBuffer.sampleRate);
+  }
+
+  function extractFloat32Arrays(value, output = [], seen = new Set(), depth = 0) {
+    if (!value || output.length > 8 || depth > 4) return output;
+    if (Object.prototype.toString.call(value) === "[object Float32Array]") {
+      output.push(value);
+      return output;
+    }
+    if (typeof value !== "object" || seen.has(value)) return output;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) extractFloat32Arrays(item, output, seen, depth + 1);
+      return output;
+    }
+    for (const key of Object.keys(value).slice(0, 20)) {
+      extractFloat32Arrays(value[key], output, seen, depth + 1);
+    }
+    return output;
+  }
+
+  function wrapAudioBufferSource(source) {
+    if (!source || source.__mycliReadAudioSourceWrapped || typeof source.start !== "function") return source;
+    source.__mycliReadAudioSourceWrapped = true;
+    const nativeStart = source.start;
+    source.start = function mycliAudioBufferSourceStart() {
+      try { rememberReadAudioBuffer(source.buffer); } catch {}
+      return nativeStart.apply(this, arguments);
+    };
+    return source;
+  }
+
   function wrapAudioWorkletPort(node, audioContext) {
     const port = node?.port;
     if (!port || port.__mycliReadAudioPortWrapped || typeof port.postMessage !== "function") return;
@@ -453,8 +532,11 @@
     const nativePostMessage = port.postMessage;
     port.postMessage = function mycliAudioWorkletPostMessage(message) {
       try {
-        if (message?.message === "dataIn") {
-          rememberReadPcmChunk(message.data, audioContext?.sampleRate);
+        const chunks = message?.message === "dataIn"
+          ? extractFloat32Arrays(message.data)
+          : extractFloat32Arrays(message);
+        for (const chunk of chunks) {
+          rememberReadPcmChunk(chunk, audioContext?.sampleRate);
         }
       } catch {}
       return nativePostMessage.apply(this, arguments);
@@ -475,6 +557,14 @@
         } catch {}
         return nativeDecodeAudioData.apply(this, arguments);
       };
+
+      if (typeof proto.createBufferSource === "function" && !proto.__mycliReadAudioBufferSourceSnifferInstalled) {
+        proto.__mycliReadAudioBufferSourceSnifferInstalled = true;
+        const nativeCreateBufferSource = proto.createBufferSource;
+        proto.createBufferSource = function mycliCreateBufferSource() {
+          return wrapAudioBufferSource(nativeCreateBufferSource.apply(this, arguments));
+        };
+      }
     }
 
     const NativeAudioWorkletNode = pageWindow.AudioWorkletNode;
@@ -977,6 +1067,22 @@
     return text.trim();
   }
 
+  function userMessageClassMatches(className) {
+    const value = String(className || "");
+    return (
+      /(?:^|\s)(?:justify-end|items-end)(?:\s|$)/.test(value) ||
+      /(?:^|\s)(?:bg|text)-g-send-msg-bubble(?:-\w+)?(?:\s|$)/.test(value) ||
+      /send-msg-bubble/i.test(value)
+    );
+  }
+
+  function isUserMessageElement(element) {
+    for (let node = element, depth = 0; node && depth < 10; node = node.parentElement, depth += 1) {
+      if (userMessageClassMatches(node.className)) return true;
+    }
+    return false;
+  }
+
   function collectAnswerCandidates(prompt) {
     const selectors = [
       "[class*='md-box-root' i]",
@@ -1007,6 +1113,7 @@
         bottom: element.getBoundingClientRect().bottom,
         height: element.getBoundingClientRect().height,
       }))
+      .filter((item) => !isUserMessageElement(item.element))
       .filter((item) => item.text)
       .filter((item) => item.height > 0)
       .sort((a, b) => a.bottom - b.bottom);
@@ -1242,6 +1349,23 @@
     ].join(" ");
   }
 
+  function spokenTextFromReadPrompt(prompt) {
+    const parts = String(prompt || "").split(/\n{2,}/);
+    return (parts.length > 1 ? parts.slice(1).join("\n\n") : parts[0] || "").replace(/\s+/g, "");
+  }
+
+  function minReadPcmBytesForPrompt(prompt, sampleRate = readAudioCapture.sampleRate || 24000) {
+    const spokenLength = spokenTextFromReadPrompt(prompt).length;
+    const minSeconds = Math.max(0.5, Math.min(20, spokenLength / 18));
+    return Math.floor(minSeconds * sampleRate * 4);
+  }
+
+  function readAudioShortfallMessage(prompt) {
+    const minPcmBytes = minReadPcmBytesForPrompt(prompt);
+    if (readAudioCapture.pcmBytes >= minPcmBytes) return "";
+    return `Captured read-aloud playback is too short (${readAudioCapture.pcmBytes}/${minPcmBytes} PCM bytes)`;
+  }
+
   function blobFromReadAudioChunks() {
     const chunks = readAudioCapture.chunks.slice();
     const pcmChunks = readAudioCapture.pcmChunks.slice();
@@ -1449,14 +1573,51 @@
   }
 
   function collectReadAloudButtons() {
-    return clickableElements()
+    const speakerIconPattern = /M11 1\.99882C11\.5522 1\.99882/;
+    const genericSpeakerPattern = /C.*V|L.*V|M.*(21|20|19).*12|M.*12.*(21|20|19)/;
+    const genericPlayPattern = /M\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s*[Ll]\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s*[Ll]\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?/;
+    return [...document.querySelectorAll("button, [role='button'], [aria-label], [title]")]
+      .filter(isClickable)
+      .filter((element) => !element.closest(`#${STATUS_ID}`))
       .map((element) => ({
         element,
         text: (buttonText(element) || shortVisibleText(element)).replace(/\s+/g, " ").trim(),
+        label: [
+          element.getAttribute("aria-label"),
+          element.getAttribute("title"),
+        ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim(),
         rect: element.getBoundingClientRect(),
+        svgPath: [...element.querySelectorAll("svg path")].map((path) => path.getAttribute("d") || "").join(" "),
+        svgCount: element.querySelectorAll("svg").length,
       }))
-      .filter((item) => /朗读|read aloud/i.test(item.text))
-      .filter((item) => !/自动播报|auto|暂停|停止|pause|stop/i.test(item.text));
+      .filter((item) => item.text.length <= 40 || speakerIconPattern.test(item.svgPath))
+      .filter((item) =>
+        readActionLabelMatches(item.text) ||
+        readActionLabelMatches(item.label) ||
+        speakerIconPattern.test(item.svgPath) ||
+        likelyReadIconButton(item, genericSpeakerPattern, genericPlayPattern),
+      )
+      .filter((item) => !readActionLabelForbidden(item.text) && !readActionLabelForbidden(item.label));
+  }
+
+  function readActionLabelForbidden(text) {
+    return /自动播报|auto|暂停|停止|pause|stop|下载|download|复制|copy|点赞|喜欢|like|点踩|dislike|分享|share|更多|more|重新生成|regenerate|删除|delete/i.test(String(text || ""));
+  }
+
+  function readActionLabelMatches(text) {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return false;
+    if (readActionLabelForbidden(normalized)) return false;
+    return /^(朗读|朗读全文|播放|播放朗读|收听|read aloud|play|speak|listen)$/i.test(normalized);
+  }
+
+  function likelyReadIconButton(item, speakerPattern, playPattern) {
+    if (!item.svgCount || !item.svgPath || readActionLabelForbidden(item.text)) return false;
+    const rect = item.rect;
+    const smallControl = rect.width >= 16 && rect.width <= 64 && rect.height >= 16 && rect.height <= 64;
+    if (!smallControl) return false;
+    if (speakerPattern.test(item.svgPath) || playPattern.test(item.svgPath)) return true;
+    return false;
   }
 
   function readAloudIsPlaying() {
@@ -1466,24 +1627,164 @@
     });
   }
 
-  function findReadAloudButton(answerItem) {
-    const buttons = collectReadAloudButtons();
-    if (!buttons.length) return null;
-    const answerRect = answerItem?.element?.getBoundingClientRect?.();
-    if (!answerRect) return buttons.sort((a, b) => a.rect.bottom - b.rect.bottom).at(-1)?.element || null;
-
-    return buttons
-      .map((item) => {
-        const belowPenalty = item.rect.top < answerRect.bottom - 80 ? 5000 : 0;
-        const vertical = Math.abs(item.rect.top - answerRect.bottom);
-        const horizontal = Math.abs(item.rect.left - answerRect.left);
-        return { ...item, score: belowPenalty + vertical + horizontal / 20 };
-      })
-      .sort((a, b) => a.score - b.score)[0]?.element || null;
+  function dispatchPointerMouseEvent(element, type, rect) {
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      button: 0,
+      buttons: type.endsWith("down") ? 1 : 0,
+    };
+    const Ctor = type.startsWith("pointer") && typeof PointerEvent === "function" ? PointerEvent : MouseEvent;
+    element.dispatchEvent(new Ctor(type, init));
   }
 
-  async function saveReadAudio(jobId) {
+  function humanClick(element) {
+    if (!element) return;
+    try { element.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+    const rect = element.getBoundingClientRect();
+    const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) || element;
+    for (const type of ["pointerover", "mouseover", "pointerenter", "mouseenter", "pointermove", "mousemove"]) {
+      try { dispatchPointerMouseEvent(target, type, rect); } catch {}
+    }
+    try { target.focus?.({ preventScroll: true }); } catch {}
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      try { dispatchPointerMouseEvent(target, type, rect); } catch {}
+    }
+    if (target !== element) {
+      try { element.click(); } catch {}
+    }
+  }
+
+  function revealReadActions(answerItem) {
+    const element = answerItem?.element;
+    if (!element) return;
+    try { element.scrollIntoView({ block: "end", inline: "nearest" }); } catch {}
+    const rect = element.getBoundingClientRect();
+    const hoverRect = {
+      left: Math.max(0, Math.min(rect.left + 80, window.innerWidth - 2)),
+      top: Math.max(0, Math.min(rect.bottom - 32, window.innerHeight - 2)),
+      width: 2,
+      height: 2,
+    };
+    for (const target of [element, element.parentElement, element.closest("[class*='message' i]")].filter(Boolean)) {
+      for (const type of ["pointerover", "mouseover", "pointerenter", "mouseenter", "pointermove", "mousemove"]) {
+        try { dispatchPointerMouseEvent(target, type, hoverRect); } catch {}
+      }
+    }
+  }
+
+  function readButtonDebug(element) {
+    if (!element) return "none";
+    const rect = element.getBoundingClientRect();
+    const text = (buttonText(element) || shortVisibleText(element)).replace(/\s+/g, " ").trim();
+    const className = String(element.className || "").replace(/\s+/g, ".").slice(0, 120);
+    const parent = element.parentElement ? String(element.parentElement.className || "").replace(/\s+/g, ".").slice(0, 80) : "";
+    const anchor = element.closest("a[href]");
+    return [
+      `tag=${element.tagName?.toLowerCase?.() || "?"}`,
+      `text=${JSON.stringify(text.slice(0, 80))}`,
+      `aria=${JSON.stringify(element.getAttribute("aria-label") || "")}`,
+      `title=${JSON.stringify(element.getAttribute("title") || "")}`,
+      `role=${JSON.stringify(element.getAttribute("role") || "")}`,
+      `dbx=${JSON.stringify(element.getAttribute("data-dbx-name") || "")}`,
+      `href=${JSON.stringify(anchor?.getAttribute("href") || "")}`,
+      `rect=${Math.round(rect.left)},${Math.round(rect.top)},${Math.round(rect.width)}x${Math.round(rect.height)}`,
+      `class=${JSON.stringify(className)}`,
+      `parent=${JSON.stringify(parent)}`,
+    ].join(" ");
+  }
+
+  function readButtonCandidatesDebug(answerItem) {
+    const candidates = rankedReadAloudButtons(answerItem).slice(0, 8);
+    if (!candidates.length) return "no candidates";
+    return candidates.map((item, index) => `${index + 1}. ${readButtonDebug(item.element)}`).join(" | ");
+  }
+
+  async function waitForReadAloudButton(answerItem, timeoutMs = 15000) {
+    const started = Date.now();
+    let lastDebugAt = 0;
+    while (Date.now() - started < timeoutMs) {
+      revealReadActions(answerItem);
+      const button = findReadAloudButton(answerItem);
+      if (button) return button;
+      if (Date.now() - lastDebugAt > 2000) {
+        lastDebugAt = Date.now();
+        setStatus(`waiting read button\nbuttons=${collectReadAloudButtons().length}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return null;
+  }
+
+  function rankedReadAloudButtons(answerItem) {
+    const buttons = collectReadAloudButtons();
+    if (!buttons.length) return [];
+    const answerRect = answerItem?.element?.getBoundingClientRect?.();
+    if (!answerRect) {
+      return buttons
+        .filter((item) => !readButtonInPageChrome(item.element, item.rect))
+        .sort((a, b) => buttonLabelScore(b) - buttonLabelScore(a) || b.rect.bottom - a.rect.bottom);
+    }
+
+    return buttons
+      .filter((item) => readButtonNearAnswer(item, answerRect))
+      .map((item) => {
+        const labelBonus = buttonLabelScore(item) * -1000;
+        const vertical = Math.abs(item.rect.top - answerRect.bottom);
+        const horizontal = Math.abs(item.rect.left - answerRect.left);
+        return { ...item, score: labelBonus + vertical + horizontal / 20 };
+      })
+      .sort((a, b) => a.score - b.score);
+  }
+
+  function buttonLabelScore(item) {
+    const label = item.label || item.text;
+    if (readActionLabelMatches(label)) return 2;
+    if (readActionLabelMatches(item.text)) return 1;
+    return 0;
+  }
+
+  function readButtonInPageChrome(element, rect = element?.getBoundingClientRect?.()) {
+    if (!element || !rect) return true;
+    const href = element.closest("a[href]")?.getAttribute("href") || "";
+    if (href && /^\/?(chat|home|discover|bot|apps?|setting|user|profile)\b/i.test(href)) return true;
+    const chrome = element.closest("header, nav, aside, [role='banner'], [class*='header' i], [class*='sidebar' i], [class*='sider' i], [class*='navigation' i]");
+    if (!chrome) return false;
+    const chromeRect = chrome.getBoundingClientRect();
+    return chromeRect.top <= 90 || chromeRect.left <= 280 || (chromeRect.width > window.innerWidth * 0.6 && chromeRect.height <= 120);
+  }
+
+  function readButtonNearAnswer(item, answerRect) {
+    const rect = item.rect;
+    if (readButtonInPageChrome(item.element, rect)) return false;
+    if (rect.bottom < 0 || rect.top > window.innerHeight + 80) return false;
+    if (rect.width < 12 || rect.height < 12) return false;
+    if (rect.width > 180 || rect.height > 80) return false;
+
+    const nearBottomTop = answerRect.bottom - 220;
+    const nearBottomBottom = answerRect.bottom + 360;
+    if (rect.top < nearBottomTop || rect.top > nearBottomBottom) return false;
+
+    const left = Math.max(0, answerRect.left - 160);
+    const right = Math.min(window.innerWidth, Math.max(answerRect.right + 160, answerRect.left + 720));
+    if (rect.right < left || rect.left > right) return false;
+
+    return buttonLabelScore(item) > 0 || likelyReadIconButton(item, /C.*V|L.*V|M.*(21|20|19).*12|M.*12.*(21|20|19)/, /M\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s*[Ll]\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s*[Ll]\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?/);
+  }
+
+  function findReadAloudButton(answerItem, skipped = new Set()) {
+    return rankedReadAloudButtons(answerItem).find((item) => !skipped.has(item.element))?.element || null;
+  }
+
+  async function saveReadAudio(jobId, prompt) {
     const source = selectReadAudioSource(readAudioCapture.chunks, readAudioCapture.pcmChunks);
+    if (source !== "pcm") throw new Error("No read-aloud playback stream was captured");
+    const shortfall = readAudioShortfallMessage(prompt);
+    if (shortfall) throw new Error(shortfall);
     const captureSummary = readAudioCaptureSummary(source);
     const blob = blobFromReadAudioChunks();
     const extension = extensionFromBlob(blob) || "wav";
@@ -1498,18 +1799,46 @@
   async function clickReadAloudAndSave(prompt, jobId, timeoutMs) {
     installReadAudioSniffer();
     const answerItem = latestAnswerCandidate(prompt);
-    const button = findReadAloudButton(answerItem);
-    if (!button) throw new Error("Could not find read-aloud button");
+    const button = await waitForReadAloudButton(answerItem);
+    if (!button) throw new Error(`Could not find read-aloud button (${readButtonCandidatesDebug(answerItem)})`);
 
     resetReadAudioCapture();
     setStatus("starting read-aloud");
-    button.click();
+    sendWs({ type: "log", level: "info", msg: `[read ${jobId.slice(0, 8)}] clicking read button ${readButtonDebug(button)}` });
+    humanClick(button);
 
     const started = Date.now();
     const totalTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : PODCAST_TIMEOUT_MS;
     let lastChunkCount = 0;
     let sawPlaying = false;
+    let sawDomPlaying = false;
     let lastDebugAt = 0;
+    let lastClickAt = started;
+    const triedButtons = new Set([button]);
+    let shortCaptureRetries = 0;
+
+    const retryShortCapture = async () => {
+      const shortfall = readAudioShortfallMessage(prompt);
+      if (!shortfall || shortCaptureRetries >= READ_AUDIO_SHORT_RETRY_LIMIT) return false;
+      shortCaptureRetries += 1;
+      sendWs({
+        type: "log",
+        level: "warn",
+        msg: `[read ${jobId.slice(0, 8)}] ${shortfall}; retrying read-aloud ${shortCaptureRetries}/${READ_AUDIO_SHORT_RETRY_LIMIT} ${readAudioCaptureSummary()}`,
+      });
+      revealReadActions(answerItem);
+      const retryButton = findReadAloudButton(answerItem) || button;
+      if (!retryButton) return false;
+      resetReadAudioCapture();
+      lastChunkCount = 0;
+      sawPlaying = false;
+      sawDomPlaying = false;
+      setStatus(`retrying short read audio\n${shortCaptureRetries}/${READ_AUDIO_SHORT_RETRY_LIMIT}`);
+      humanClick(retryButton);
+      lastClickAt = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      return true;
+    };
 
     try {
       while (Date.now() - started < totalTimeoutMs) {
@@ -1525,33 +1854,52 @@
         }
 
         const chunkCount = readAudioCapture.chunks.length + readAudioCapture.pcmChunks.length;
+        const playbackChunkCount = readAudioCapture.pcmChunks.length;
         if (chunkCount !== lastChunkCount) {
           lastChunkCount = chunkCount;
-          setStatus(`capturing read audio\nchunks=${chunkCount}`);
+          setStatus(`capturing read audio\npcm=${playbackChunkCount} encoded=${readAudioCapture.chunks.length}`);
         }
 
         const playing = readAloudIsPlaying();
-        if (playing) sawPlaying = true;
+        if (playing) sawDomPlaying = true;
+        if (playing || playbackChunkCount) sawPlaying = true;
         const quietFor = readAudioCapture.lastChunkAt ? Date.now() - readAudioCapture.lastChunkAt : 0;
 
-        if (chunkCount && sawPlaying && !playing && quietFor > 1000) {
-          const saved = await saveReadAudio(jobId);
+        if (!chunkCount && !playing && Date.now() - lastClickAt > 3000) {
+          revealReadActions(answerItem);
+          const retryButton = findReadAloudButton(answerItem, triedButtons);
+          if (retryButton) {
+            setStatus("retrying read-aloud");
+            sendWs({ type: "log", level: "info", msg: `[read ${jobId.slice(0, 8)}] retrying read button ${readButtonDebug(retryButton)}` });
+            humanClick(retryButton);
+            triedButtons.add(retryButton);
+            lastClickAt = Date.now();
+          } else {
+            triedButtons.clear();
+            triedButtons.add(button);
+            lastClickAt = Date.now();
+          }
+        }
+
+        if (!chunkCount && Date.now() - started > READ_AUDIO_START_TIMEOUT_MS) {
+          throw new Error(`Read-aloud did not start after clicking button (${readButtonDebug(button)})`);
+        }
+
+        if (playbackChunkCount && sawDomPlaying && !playing && quietFor > 1000) {
+          if (await retryShortCapture()) continue;
+          const saved = await saveReadAudio(jobId, prompt);
           return `Read audio saved: ${saved.savedPath} (${saved.size} bytes)`;
         }
 
-        if (chunkCount && quietFor > READ_AUDIO_FALLBACK_QUIET_MS) {
-          const saved = await saveReadAudio(jobId);
-          return `Read audio saved: ${saved.savedPath} (${saved.size} bytes)`;
-        }
-
-        if (chunkCount && quietFor > READ_AUDIO_QUIET_MS && !playing) {
-          const saved = await saveReadAudio(jobId);
+        if (playbackChunkCount && sawPlaying && quietFor > READ_AUDIO_QUIET_MS) {
+          if (await retryShortCapture()) continue;
+          const saved = await saveReadAudio(jobId, prompt);
           return `Read audio saved: ${saved.savedPath} (${saved.size} bytes)`;
         }
 
         if (Date.now() - lastDebugAt > 3000) {
           lastDebugAt = Date.now();
-          setStatus(`waiting read audio\nchunks=${chunkCount} playing=${playing ? "yes" : "no"} quiet=${(quietFor / 1000).toFixed(1)}s`);
+          setStatus(`waiting read audio\npcm=${playbackChunkCount} encoded=${readAudioCapture.chunks.length} playing=${playing ? "yes" : "no"} quiet=${(quietFor / 1000).toFixed(1)}s`);
         }
       }
     } finally {
@@ -1675,12 +2023,14 @@
   }
 
   function sendWs(message) {
+    if (stopped) return;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(message));
     }
   }
 
   async function handleCommand(cmd) {
+    if (stopped) return;
     if (busy) {
       sendWs({ type: "result", id: cmd.id, ok: false, error: "Userscript is busy with another command" });
       return;
@@ -1699,6 +2049,7 @@
   }
 
   function scheduleReconnect() {
+    if (stopped) return;
     if (reconnectTimer) return;
     const delay = reconnectDelay;
     reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
@@ -1710,6 +2061,7 @@
   }
 
   function scheduleStandbyRetry() {
+    if (stopped) return;
     if (reconnectTimer) return;
     reconnectDelay = RECONNECT_MIN_MS;
     reconnectTimer = setTimeout(() => {
@@ -1720,6 +2072,7 @@
   }
 
   function connect() {
+    if (stopped) return;
     if (!becomeWorker()) {
       if (lastStatus !== "standby, another tab is worker") {
         setStatus("standby, another tab is worker");
@@ -1738,6 +2091,7 @@
     }
 
     ws.addEventListener("open", () => {
+      if (stopped) return;
       reconnectDelay = RECONNECT_MIN_MS;
       standby = false;
       setStatus("connected, waiting");
@@ -1745,6 +2099,7 @@
     });
 
     ws.addEventListener("message", (event) => {
+      if (stopped) return;
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
       if (msg.type === "command") {
@@ -1767,6 +2122,7 @@
 
     ws.addEventListener("close", () => {
       ws = null;
+      if (stopped) return;
       if (standby) {
         scheduleStandbyRetry();
         return;
@@ -1783,9 +2139,11 @@
 
   // Keep the worker lock fresh as long as this tab is the worker.
   setInterval(() => {
+    if (stopped) return;
     if (ws && ws.readyState === WebSocket.OPEN) becomeWorker();
   }, Math.max(1000, Math.floor(LOCK_TTL_MS / 2)));
 
+  installInstanceGuard();
   setStatus("starting");
   installReadAudioSniffer();
   installPodcastNetworkSniffer();

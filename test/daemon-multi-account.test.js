@@ -1,5 +1,7 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { WebSocket } = require("ws");
@@ -29,7 +31,7 @@ async function waitFor(fn, timeoutMs = 5000, label = "condition") {
 }
 
 // Minimal fake userscript peer: connects, says hello, queues incoming messages.
-function openPeer({ site, accountId, accountName, takeover }) {
+function openPeer({ site, accountId, accountName, takeover, contextId }) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
     const queue = [];
@@ -49,7 +51,7 @@ function openPeer({ site, accountId, accountName, takeover }) {
         type: "hello",
         site,
         version: "test",
-        contextId: `tab-${accountId || site}-${Math.random().toString(16).slice(2)}`,
+        contextId: contextId || `tab-${accountId || site}-${Math.random().toString(16).slice(2)}`,
         accountId,
         accountName,
         takeover,
@@ -167,6 +169,53 @@ test("legacy sites without account ids reject duplicate pages without kicking th
   tab1.replyTo(() => ({ from: "toutiao-1" }));
   const result = await sendCommand({ site: "toutiao", action: "noop", args: {} });
   assert.deepStrictEqual(result.result, { from: "toutiao-1" });
+});
+
+test("same browser context duplicate replaces the worker", async () => {
+  const contextId = "doubao-shared-tab";
+  const tab1 = await openPeer({ site: "doubao-context", contextId });
+  assert.strictEqual((await tab1.next()).type, "hello_ack");
+  const tab2 = await openPeer({ site: "doubao-context", contextId });
+  assert.strictEqual((await tab2.next()).type, "hello_ack");
+  await waitFor(() => tab1.isClosed(), 3000, "replaced same-context peer close");
+  assert.strictEqual(tab2.isClosed(), false);
+
+  tab2.replyTo(() => ({ from: "second-context" }));
+  const result = await sendCommand({ site: "doubao-context", action: "noop", args: {} });
+  assert.deepStrictEqual(result.result, { from: "second-context" });
+});
+
+test("audio uploads to hidden temp output dirs return a visible parent copy", async () => {
+  const peer = await openPeer({ site: "upload-audio" });
+  assert.strictEqual((await peer.next()).type, "hello_ack");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mycli-audio-upload-"));
+  const hiddenOutputDir = path.join(root, ".audio.test1234");
+  const filename = "doubao-read-test.wav";
+  const commandPromise = sendCommand({
+    site: "upload-audio",
+    action: "save-audio",
+    args: { output_dir: hiddenOutputDir },
+    timeout_ms: 5000,
+  });
+
+  const command = await peer.next();
+  assert.strictEqual(command.type, "command");
+
+  const uploadRes = await fetch(`${API}/upload?cmd_id=${encodeURIComponent(command.id)}&filename=${encodeURIComponent(filename)}`, {
+    method: "POST",
+    body: Buffer.from("RIFF test wav"),
+  });
+  const upload = await uploadRes.json();
+  assert.strictEqual(upload.ok, true);
+  assert.strictEqual(upload.complete, true);
+  assert.strictEqual(upload.path, path.join(root, filename));
+  assert.strictEqual(fs.existsSync(path.join(hiddenOutputDir, filename)), true);
+  assert.strictEqual(fs.existsSync(path.join(root, filename)), true);
+
+  peer.ws.send(JSON.stringify({ type: "result", id: command.id, ok: true, data: { path: upload.path } }));
+  const result = await commandPromise;
+  assert.deepStrictEqual(result.result, { path: path.join(root, filename) });
 });
 
 test("different legacy sites coexist", async () => {

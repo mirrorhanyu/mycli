@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli ChatGPT Bridge
 // @namespace    local.mycli.chatgpt
-// @version      0.1.3
+// @version      0.1.6
 // @description  HTTP bridge to the mycli micro-daemon. Generates and downloads ChatGPT images.
 // @match        https://chatgpt.com/*
 // @downloadURL  http://127.0.0.1:17872/userscript/chatgpt/mycli.user.js
@@ -21,7 +21,7 @@
 
   const HTTP_API = "http://127.0.0.1:17872";
   const SITE = "chatgpt";
-  const VERSION = "0.1.3";
+  const VERSION = "0.1.6";
   const TAB_ID_KEY = "mycli-chatgpt-tab-id";
   const TAB_ID = (() => {
     try {
@@ -47,6 +47,25 @@
     medium: "Medium",
     high: "High",
   };
+  const MODE_MENU_SELECTOR = [
+    '[data-testid="composer-intelligence-picker-content"]',
+    '[role="menu"]',
+    '[role="listbox"]',
+    '[role="dialog"]',
+    '[data-radix-popper-content-wrapper]',
+    '[data-radix-menu-content]',
+    '[data-radix-dropdown-menu-content]',
+    '[data-slot="popover-content"]',
+    '[data-slot="dropdown-menu-content"]',
+  ].join(", ");
+  const MODE_OPTION_SELECTOR = [
+    '[role="menuitemradio"]',
+    '[role="menuitem"]',
+    '[role="option"]',
+    'button',
+    '[tabindex="0"]',
+    '[data-radix-collection-item]',
+  ].join(", ");
 
   let busy = false;
   let stopped = false;
@@ -81,6 +100,115 @@
 
   function normalizedText(element) {
     return (element?.innerText || element?.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function compactText(text, limit = 240) {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    return normalized.length > limit ? `${normalized.slice(0, limit)}...` : normalized;
+  }
+
+  function elementSearchText(element) {
+    return [
+      normalizedText(element),
+      element?.getAttribute?.("aria-label") || "",
+      element?.getAttribute?.("title") || "",
+    ].join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  function textHasModeLabel(text, label) {
+    return new RegExp(`(^|\\s)${label}(\\s|$)`, "i").test(String(text || ""));
+  }
+
+  function modeLabelForElement(element) {
+    const text = elementSearchText(element);
+    return Object.values(MODE_LABELS).find((label) => textHasModeLabel(text, label)) || "";
+  }
+
+  function describeElement(element) {
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    return {
+      tag: element.tagName?.toLowerCase() || "",
+      id: element.id || "",
+      role: element.getAttribute?.("role") || "",
+      testid: element.getAttribute?.("data-testid") || "",
+      ariaLabel: compactText(element.getAttribute?.("aria-label") || "", 120),
+      ariaHaspopup: element.getAttribute?.("aria-haspopup") || "",
+      ariaExpanded: element.getAttribute?.("aria-expanded") || "",
+      className: compactText(element.getAttribute?.("class") || "", 160),
+      text: compactText(normalizedText(element), 240),
+      rect: {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        w: Math.round(rect.width),
+        h: Math.round(rect.height),
+      },
+    };
+  }
+
+  function debugElements(selector, limit = 12) {
+    return [...document.querySelectorAll(selector)]
+      .filter(visible)
+      .slice(0, limit)
+      .map(describeElement);
+  }
+
+  function debugTextMatches(limit = 16) {
+    const labels = Object.values(MODE_LABELS);
+    const matches = [];
+    for (const element of document.querySelectorAll("button, [role], [aria-label], [tabindex]")) {
+      if (!visible(element)) continue;
+      const text = elementSearchText(element);
+      if (!labels.some((label) => textHasModeLabel(text, label))) continue;
+      matches.push(describeElement(element));
+      if (matches.length >= limit) break;
+    }
+    return matches;
+  }
+
+  function modeSelectionDebug(root, trigger, label) {
+    const data = {
+      targetLabel: label,
+      url: location.href,
+      activeElement: describeElement(document.activeElement),
+      composer: describeElement(root),
+      trigger: describeElement(trigger),
+      modeButtons: debugElements([
+        'button[aria-haspopup]',
+        'button[data-testid*="intelligence"]',
+        'button[data-testid*="model"]',
+        'button[data-testid*="mode"]',
+        'button[aria-label*="model" i]',
+        'button[aria-label*="mode" i]',
+      ].join(", "), 16),
+      menus: debugElements(MODE_MENU_SELECTOR, 16),
+      modeTextMatches: debugTextMatches(20),
+    };
+    return JSON.stringify(data, null, 2).slice(0, 7000);
+  }
+
+  function activateElement(element) {
+    if (!element) return;
+    element.scrollIntoView?.({ block: "center", inline: "center" });
+    element.focus?.();
+    const rect = element.getBoundingClientRect();
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: 0,
+      buttons: 1,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    };
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      try {
+        element.dispatchEvent(new MouseEvent(type, init));
+      } catch {
+        element.dispatchEvent(new Event(type, { bubbles: true, cancelable: true, composed: true }));
+      }
+    }
+    element.click?.();
   }
 
   function ensureStatusBox() {
@@ -147,17 +275,35 @@
   }
 
   function currentModeButton(root = composer()) {
-    return [...(root?.querySelectorAll('button[aria-haspopup="menu"]') || [])]
+    return [...(root?.querySelectorAll([
+      'button[aria-haspopup]',
+      'button[data-testid*="intelligence"]',
+      'button[data-testid*="model"]',
+      'button[data-testid*="mode"]',
+      'button[aria-label*="model" i]',
+      'button[aria-label*="mode" i]',
+    ].join(", ")) || [])]
       .filter(visible)
-      .find((button) => Object.values(MODE_LABELS).includes(normalizedText(button))) || null;
+      .find((button) => modeLabelForElement(button)) || null;
+  }
+
+  function modeOptionCandidates(root) {
+    if (!root) return [];
+    const candidates = root.matches?.(MODE_OPTION_SELECTOR) ? [root] : [];
+    candidates.push(...root.querySelectorAll(MODE_OPTION_SELECTOR));
+    return [...new Set(candidates)].filter(visible);
+  }
+
+  function findModeOption(root, label, excludeRoot = null) {
+    return modeOptionCandidates(root)
+      .filter((item) => !excludeRoot?.contains(item))
+      .find((item) => textHasModeLabel(elementSearchText(item), label)) || null;
   }
 
   function modeMenu() {
-    return [...document.querySelectorAll(
-      '[data-testid="composer-intelligence-picker-content"], [role="menu"]'
-    )]
+    return [...document.querySelectorAll(MODE_MENU_SELECTOR)]
       .filter(visible)
-      .find((menu) => [...menu.querySelectorAll('[role="menuitemradio"]')].some(visible)) || null;
+      .find((menu) => Object.values(MODE_LABELS).some((label) => findModeOption(menu, label))) || null;
   }
 
   async function selectMode(mode) {
@@ -167,20 +313,27 @@
     let trigger = await waitFor(() => currentModeButton(root), {
       label: "ChatGPT intelligence picker",
     });
-    if (normalizedText(trigger) === label) {
-      if (trigger.getAttribute("aria-expanded") === "true") trigger.click();
+    if (modeLabelForElement(trigger) === label) {
+      if (trigger.getAttribute("aria-expanded") === "true") activateElement(trigger);
       return;
     }
-    if (trigger.getAttribute("aria-expanded") !== "true") trigger.click();
-    const menu = await waitFor(() => modeMenu(), { label: "ChatGPT intelligence menu" });
-    const option = [...menu.querySelectorAll('[role="menuitemradio"]')]
-      .filter(visible)
-      .find((item) => normalizedText(item) === label);
+    if (trigger.getAttribute("aria-expanded") !== "true") activateElement(trigger);
+    let opened;
+    try {
+      opened = await waitFor(() => {
+        const menu = modeMenu();
+        const fallbackOption = findModeOption(document.body, label, root);
+        return menu || fallbackOption ? { menu, fallbackOption } : null;
+      }, { label: "ChatGPT intelligence menu" });
+    } catch (error) {
+      throw new Error(`${error.message}\nChatGPT mode DOM debug:\n${modeSelectionDebug(root, trigger, label)}`);
+    }
+    const option = findModeOption(opened.menu, label) || opened.fallbackOption;
     if (!option) throw new Error(`ChatGPT mode is unavailable: ${label}`);
-    option.click();
+    activateElement(option);
     await waitFor(() => {
       trigger = currentModeButton(root);
-      return trigger && normalizedText(trigger) === label;
+      return trigger && modeLabelForElement(trigger) === label;
     }, { label: `${label} mode selection` });
   }
 
@@ -442,7 +595,7 @@
       timeoutMs: 10000,
       label: "enabled ChatGPT send button",
     });
-    if (normalizedText(currentModeButton(root)) !== MODE_LABELS[mode]) {
+    if (modeLabelForElement(currentModeButton(root)) !== MODE_LABELS[mode]) {
       throw new Error(`ChatGPT mode changed before send: expected ${MODE_LABELS[mode]}`);
     }
     button.click();

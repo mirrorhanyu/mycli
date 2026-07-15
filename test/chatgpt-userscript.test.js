@@ -26,6 +26,25 @@ test("ChatGPT userscript uses stable composer and image selectors", () => {
   assert.match(source, /image-gen-overlay-actions/);
 });
 
+test("ChatGPT userscript tolerates alternate intelligence menu markup", () => {
+  assert.match(source, /MODE_MENU_SELECTOR/);
+  assert.match(source, /\[role="listbox"\]/);
+  assert.match(source, /\[role="dialog"\]/);
+  assert.match(source, /data-radix-popper-content-wrapper/);
+  assert.match(source, /\[role="option"\]/);
+  assert.match(source, /findModeOption\(document\.body, label, root\)/);
+});
+
+test("ChatGPT userscript reports mode picker DOM debug on timeout", () => {
+  assert.match(source, /@version\s+0\.1\.6/);
+  assert.match(source, /const VERSION = "0\.1\.6"/);
+  assert.match(source, /modeSelectionDebug/);
+  assert.match(source, /ChatGPT mode DOM debug/);
+  assert.match(source, /debugTextMatches/);
+  assert.match(source, /pointerdown/);
+  assert.doesNotMatch(source, /view:\s*window/);
+});
+
 test("ChatGPT userscript downloads generated images through the local upload endpoint", () => {
   assert.match(source, /GM_xmlhttpRequest/);
   assert.match(source, /HTTP_API}\/upload/);
