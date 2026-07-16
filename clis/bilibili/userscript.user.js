@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli Bilibili Bridge
 // @namespace    local.mycli.bilibili
-// @version      0.2.0
+// @version      0.2.1
 // @description  WebSocket bridge to the mycli micro-daemon for Bilibili recent-upload and sell jobs.
 // @match        https://*.bilibili.com/*
 // @match        https://bilibili.com/*
@@ -26,7 +26,7 @@
   const HTTP_API = "http://127.0.0.1:17872";
   const WS_URL = "ws://127.0.0.1:17872/ws";
   const SITE = "bilibili";
-  const VERSION = "0.2.0";
+  const VERSION = "0.2.1";
   const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   // accountId -> { accountId, accountName, lockedAt }; a map so that several
   // accounts (e.g. containers or incognito sharing GM storage) can stay locked
@@ -38,6 +38,7 @@
   const RECONNECT_MAX_MS = 15000;
   const DEFAULT_WEB_LOCATION = "333.1387";
   const DEFAULT_SELL_REFERER = "https://cm.bilibili.com/";
+  const SELL_BATCH_SIZE = 5;
 
   let ws = null;
   let busy = false;
@@ -663,7 +664,7 @@
     }
   }
 
-  function chunkUrls(urls, maxLen = 12000, maxItems = 5) {
+  function chunkUrls(urls, maxLen = 12000, maxItems = SELL_BATCH_SIZE) {
     const batches = [];
     let current = [];
     let currentLen = 0;
@@ -679,6 +680,14 @@
       }
     }
     if (current.length) batches.push(current);
+    return batches;
+  }
+
+  function chunkItems(items, maxItems = SELL_BATCH_SIZE) {
+    const batches = [];
+    for (let index = 0; index < items.length; index += maxItems) {
+      batches.push(items.slice(index, index + maxItems));
+    }
     return batches;
   }
 
@@ -758,11 +767,11 @@
     return { rowByUrl, debug };
   }
 
-  async function addGoodToSelectionCart(rawGood, referer) {
+  async function addGoodsToSelectionCart(rawGoods, referer) {
     const response = await postMallJson(
       "https://mall.bilibili.com/mall-cbp/web/selectionCart/item/add",
       {
-        goods: [rawGood],
+        goods: rawGoods,
         operateSource: 2,
         bizExtraInfo: "",
         fromType: 12,
@@ -800,7 +809,7 @@
     );
   }
 
-  async function fetchSelectionCartRows(itemIds, referer, pageSize = 100, maxPages = 20, logStep = null) {
+  async function fetchSelectionCartRows(itemIds, referer, pageSize = SELL_BATCH_SIZE, maxPages = 20, logStep = null) {
     const wanted = new Set(itemIds.map((itemId) => String(itemId || "").trim()).filter(Boolean));
     const found = new Map();
     const debug = [];
@@ -906,30 +915,55 @@
 
     debug.add = [];
     const addRows = results.filter((row) => row.item_id && row.distinguish_raw);
-    logStep(`add start items=${addRows.length}`);
-    for (let addIndex = 0; addIndex < addRows.length; addIndex += 1) {
-      const row = addRows[addIndex];
-      logStep(`add ${addIndex + 1}/${addRows.length} ${rowLabel(row)} itemId=${row.item_id}`);
+    const addBatches = chunkItems(addRows, SELL_BATCH_SIZE);
+    logStep(`add start items=${addRows.length} batches=${addBatches.length} batchSize=${SELL_BATCH_SIZE}`);
+    for (let batchIndex = 0; batchIndex < addBatches.length; batchIndex += 1) {
+      const batch = addBatches[batchIndex];
+      logStep(`add batch ${batchIndex + 1}/${addBatches.length} start items=${batch.length}`);
       try {
-        const response = await addGoodToSelectionCart(row.distinguish_raw, referer);
-        debug.add.push({ url: row.url, response });
+        const response = await addGoodsToSelectionCart(batch.map((row) => row.distinguish_raw), referer);
+        debug.add.push({ urls: batch.map((row) => row.url), response });
         const infos = Array.isArray(response?.data?.infos) ? response.data.infos : [];
-        const failedInfo = infos.find((info) => Number(info?.resCode || 0) !== 0);
         if (Number(response?.code || 0) !== 0 || response?.success !== true) {
-          row.add_error = `success=${response?.success} code=${response?.code} message=${response?.message || ""}`.trim();
-          logStep(`add ${addIndex + 1}/${addRows.length} failed ${rowLabel(row)}: ${row.add_error}`, "warn");
-        } else if (failedInfo) {
-          row.add_error = `resCode=${failedInfo?.resCode} resMsg=${failedInfo?.resMsg || ""}`.trim();
-          logStep(`add ${addIndex + 1}/${addRows.length} partial ${rowLabel(row)}: ${row.add_error}`, "warn");
-        } else {
-          logStep(`add ${addIndex + 1}/${addRows.length} done ${rowLabel(row)}`);
+          const message = `success=${response?.success} code=${response?.code} message=${response?.message || ""}`.trim();
+          for (const row of batch) row.add_error = message;
+          logStep(`add batch ${batchIndex + 1}/${addBatches.length} failed: ${message}`, "warn");
+          continue;
         }
+
+        const infoByItemId = new Map();
+        const infoByOuterId = new Map();
+        for (const info of infos) {
+          const itemId = String(info?.itemId || info?.oneItemId || "").trim();
+          const outerId = String(info?.outerId || "").trim();
+          if (itemId) infoByItemId.set(itemId, info);
+          if (outerId) infoByOuterId.set(outerId, info);
+        }
+
+        let failed = 0;
+        for (let rowIndex = 0; rowIndex < batch.length; rowIndex += 1) {
+          const row = batch[rowIndex];
+          const info = infoByItemId.get(String(row.item_id || ""))
+            || infoByOuterId.get(String(row.good_id || ""))
+            || (infos.length === batch.length ? infos[rowIndex] : null);
+          if (!info) {
+            row.add_error = "selectionCart add response missing item result";
+            failed += 1;
+            logStep(`add batch ${batchIndex + 1}/${addBatches.length} missing ${rowLabel(row)}`, "warn");
+          } else if (Number(info?.resCode || 0) !== 0) {
+            row.add_error = `resCode=${info?.resCode} resMsg=${info?.resMsg || ""}`.trim();
+            failed += 1;
+            logStep(`add batch ${batchIndex + 1}/${addBatches.length} failed ${rowLabel(row)}: ${row.add_error}`, "warn");
+          }
+        }
+        logStep(`add batch ${batchIndex + 1}/${addBatches.length} done ok=${batch.length - failed} failed=${failed}`);
       } catch (error) {
-        row.add_error = error?.message || String(error);
-        logStep(`add ${addIndex + 1}/${addRows.length} error ${rowLabel(row)}: ${String(row.add_error).slice(0, 180)}`, "error");
+        const message = error?.message || String(error);
+        for (const row of batch) row.add_error = message;
+        logStep(`add batch ${batchIndex + 1}/${addBatches.length} error: ${String(message).slice(0, 180)}`, "error");
       }
     }
-    logStep(`add done items=${addRows.length}`);
+    logStep(`add done items=${addRows.length} batches=${addBatches.length}`);
 
     if (!skipRename) {
       debug.rename = [];
@@ -962,7 +996,13 @@
     if (itemIds.length) {
       logStep(`selection start itemIds=${itemIds.length}`);
       try {
-        const { rowByItemId, debug: selectionDebug } = await fetchSelectionCartRows(itemIds, referer, 100, 20, logStep);
+        const { rowByItemId, debug: selectionDebug } = await fetchSelectionCartRows(
+          itemIds,
+          referer,
+          SELL_BATCH_SIZE,
+          20,
+          logStep,
+        );
         debug.selection = selectionDebug;
         for (const row of results) {
           if (!row.item_id) continue;
