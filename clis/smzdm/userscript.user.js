@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli SMZDM Bridge
 // @namespace    local.mycli.smzdm
-// @version      0.3.11
+// @version      0.3.13
 // @description  WebSocket bridge to the mycli micro-daemon. Syncs the current SMZDM session and saves drafts through browser-side APIs.
 // @match        https://post.smzdm.com/post/*
 // @match        https://post.smzdm.com/edit/*
@@ -18,7 +18,7 @@
   "use strict";
 
   const SITE = "smzdm";
-  const VERSION = "0.3.11";
+  const VERSION = "0.3.13";
   const AUTOSAVE_URL_RE = /\/api\/editor\/article\/(submit|save)|\/api\/draft\//;
   // Tampermonkey sandboxes the script when any GM_* grant is declared. Page
   // globals like `editor` live on the real page window, accessible via
@@ -448,7 +448,7 @@
     throw lastError;
   }
 
-  // Splits the prepared HTML into alternating html/image segments. A top-level
+  // Splits the prepared HTML into html/image/product steps. A top-level
   // block whose only meaningful child is a codex-local placeholder img becomes
   // an "image" step; everything else stays as raw html. SMZDM's image is a
   // top-level block node, so we insert it standalone (not wrapped in <p>).
@@ -462,6 +462,11 @@
       const match = placeholder && /^codex-local:\/\/image\/(\d+)$/.exec(placeholder.getAttribute("src") || "");
       if (match) {
         plan.push({ type: "image", placeholder_index: Number(match[1]) });
+        continue;
+      }
+      const product = productStepFromElement(el);
+      if (product) {
+        plan.push(product);
         continue;
       }
       plan.push({ type: "html", html: el.outerHTML });
@@ -483,16 +488,180 @@
     };
   }
 
-  function containsGoodsCardNode(node) {
-    const attrs = node && typeof node === "object" ? node.attrs : null;
-    if (
-      attrs &&
-      typeof attrs === "object" &&
-      (attrs.b2c_url || attrs.tracking_card_url)
-    ) {
-      return true;
+  function productKeyFromUrl(value) {
+    let candidate = String(value || "").trim().replace(/&amp;/g, "&");
+    for (let i = 0; i < 2; i += 1) {
+      const jd = candidate.match(/(?:https?:\/\/)?item\.jd\.com\/(\d+)\.html(?:[?#]|$)/i);
+      if (jd) return `jd:${jd[1]}`;
+      try {
+        const decoded = decodeURIComponent(candidate);
+        if (decoded === candidate) break;
+        candidate = decoded;
+      } catch {
+        break;
+      }
     }
-    return Array.isArray(node?.content) && node.content.some(containsGoodsCardNode);
+    return null;
+  }
+
+  function productStepFromElement(el) {
+    if (el.tagName !== "P") return null;
+    const meaningful = [...el.childNodes].filter(
+      (node) =>
+        node.nodeType === Node.ELEMENT_NODE ||
+        (node.nodeType === Node.TEXT_NODE && node.textContent.trim()),
+    );
+    if (meaningful.length !== 1) return null;
+    const link = meaningful[0];
+    if (link.nodeType !== Node.ELEMENT_NODE || link.tagName !== "A") return null;
+    const url = link.getAttribute("href") || "";
+    const key = productKeyFromUrl(url);
+    if (!key) return null;
+    return {
+      type: "product",
+      key,
+      url,
+      html: el.outerHTML,
+    };
+  }
+
+  function cardReferenceFromNode(node) {
+    if (!node || typeof node !== "object") return null;
+    const attrs = node.type === "card" ? node.attrs?.attrs : null;
+    const cardId = String(attrs?.["res-data-id"] || "").trim();
+    const cardType = String(attrs?.["res-card-type"] || "").trim();
+    if (cardId) return { card_id: cardId, card_type: cardType || "goods_b2c" };
+    if (!Array.isArray(node.content)) return null;
+    for (const child of node.content) {
+      const ref = cardReferenceFromNode(child);
+      if (ref) return ref;
+    }
+    return null;
+  }
+
+  function productCardHtml(card) {
+    const cardId = String(card.card_id).replace(/"/g, "&quot;");
+    const cardType = String(card.card_type || "goods_b2c").replace(/"/g, "&quot;");
+    return `<dir class="insert-card-editor" res-data-id="${cardId}" contenteditable="false" res-card-type="${cardType}" editable="false"></dir>`;
+  }
+
+  async function parseJsonResponse(response, label) {
+    const text = await response.text();
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`${label}响应不是 JSON (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    }
+    if (!response.ok || payload?.error_code !== 0) {
+      throw new Error(payload?.error_msg || `${label}失败 (HTTP ${response.status})`);
+    }
+    return payload;
+  }
+
+  async function searchProductCard(articleId, url) {
+    const body = new URLSearchParams({
+      article_id: articleId,
+      url,
+      editor_from: "long_article",
+      entrance: "link",
+    });
+    const response = await pageWindow.fetch("/api/editor/card/search", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      },
+      body: body.toString(),
+    });
+    const payload = await parseJsonResponse(response, "查询商品卡片");
+    const row = payload?.data?.rows?.[0];
+    if (!row) throw new Error(`未找到可插入的商品: ${url}`);
+    return row;
+  }
+
+  async function createProductCard(articleId, step) {
+    const storage = pageWindow.editor?.storage?.card;
+    if (!storage || typeof storage.saveCardData !== "function") {
+      throw new Error("当前编辑器不支持创建商品卡片");
+    }
+    const row = await searchProductCard(articleId, step.url);
+    const saved = await storage.saveCardData(row);
+    const cardId = saved?.insert_id || saved?.res_id;
+    if (!cardId) {
+      throw new Error(`创建商品卡片失败，未返回 card_id: ${step.url}`);
+    }
+    return {
+      key: step.key,
+      url: step.url,
+      card_id: String(cardId),
+      card_type: saved?.card_type || row.card_type || "goods_b2c",
+    };
+  }
+
+  async function currentProductCardsByKey() {
+    const editor = pageWindow.editor;
+    const storage = editor?.storage?.card;
+    if (!storage) return new Map();
+    const refs = (editor.getJSON()?.content || [])
+      .map(cardReferenceFromNode)
+      .filter(Boolean);
+    if (!refs.length) return new Map();
+
+    const missingData = refs.some((ref) => !storage.getCardData?.(ref.card_id));
+    if (missingData && typeof storage.fetchCardData === "function") {
+      for (const ref of refs) storage.setCardId?.(ref.card_id);
+      await storage.fetchCardData();
+    }
+
+    const cards = new Map();
+    for (const ref of refs) {
+      const data = storage.getCardData?.(ref.card_id) || storage.cardDataStore?.[ref.card_id];
+      const key = productKeyFromUrl(data?.b2c_url || data?.tracking_card_url);
+      if (key && !cards.has(key)) cards.set(key, ref);
+    }
+    return cards;
+  }
+
+  async function prepareProductCards(articleId, productSteps, generateProductCards) {
+    if (!generateProductCards || !productSteps.length) {
+      return {
+        cardsByKey: new Map(),
+        generatedCount: 0,
+        reusedCount: 0,
+      };
+    }
+
+    const cardsByKey = await currentProductCardsByKey();
+    let generatedCount = 0;
+    let reusedCount = 0;
+    const uniqueSteps = [...new Map(productSteps.map((step) => [step.key, step])).values()];
+
+    for (let i = 0; i < uniqueSteps.length; i += 1) {
+      const step = uniqueSteps[i];
+      if (cardsByKey.has(step.key)) {
+        reusedCount += 1;
+        continue;
+      }
+      setStatus(`draft: product ${i + 1}/${uniqueSteps.length}\n${step.key}`);
+      logStep(`product ${i + 1}/${uniqueSteps.length}: search + add ${step.url}`);
+      const card = await createProductCard(articleId, step);
+      cardsByKey.set(step.key, card);
+      generatedCount += 1;
+      logStep(`product ${i + 1} ok → card_id=${card.card_id}`);
+    }
+
+    const storage = pageWindow.editor?.storage?.card;
+    if (!storage || typeof storage.setCardId !== "function" || typeof storage.fetchCardData !== "function") {
+      throw new Error("当前编辑器不支持加载商品卡片");
+    }
+    storage.cardIds?.clear?.();
+    storage.productItemIds?.clear?.();
+    for (const card of cardsByKey.values()) storage.setCardId(card.card_id);
+    await storage.fetchCardData();
+
+    return { cardsByKey, generatedCount, reusedCount };
   }
 
   async function saveDraftViaEditor(cmd) {
@@ -516,31 +685,26 @@
 
     const attachments = Array.isArray(cmd.args?.attachments) ? cmd.args.attachments : [];
     const images = Array.isArray(cmd.args?.images) ? cmd.args.images : [];
-    const preserveCards = cmd.args?.preserve_cards === true;
-    const checkPreserveCards = cmd.args?.check_preserve_cards === true;
-    const existingCards = preserveCards
-      ? (pageWindow.editor.getJSON()?.content || []).filter(containsGoodsCardNode)
-      : [];
+    const generateProductCards = cmd.args?.generate_product_cards !== false;
+    const checkProductCards = cmd.args?.check_product_cards === true;
+    const plan = planFromHtml(rawHtml);
+    const productSteps = plan.filter((step) => step.type === "product");
 
-    if (preserveCards && existingCards.length !== images.length) {
-      throw new Error(
-        `无法安全保留商品卡片：当前 ${existingCards.length} 个，Markdown 图片 ${images.length} 张`,
-      );
-    }
-    if (checkPreserveCards) {
+    if (checkProductCards) {
       return {
         draft_id: articleId,
         draft_url: `https://post.smzdm.com/edit/${articleId}`,
         image_occurrence_count: images.length,
-        existing_card_count: existingCards.length,
-        preserve_cards_compatible: true,
+        product_link_count: productSteps.length,
+        generate_product_cards: generateProductCards,
+        product_cards_supported:
+          typeof pageWindow.editor?.storage?.card?.saveCardData === "function" &&
+          typeof pageWindow.editor?.storage?.card?.fetchCardData === "function",
       };
     }
 
     setStatus(`draft: preparing\n${articleId}`);
-    logStep(`begin: articleId=${articleId}, title=${title.slice(0, 30)}, images=${images.length}, attachments=${attachments.length}, preserveCards=${existingCards.length}`);
-    setTitle(title);
-    logStep("title set");
+    logStep(`begin: articleId=${articleId}, title=${title.slice(0, 30)}, images=${images.length}, attachments=${attachments.length}, products=${productSteps.length}`);
 
     // 1) Upload each unique attachment to SMZDM, collect real URLs.
     const urlByAttachmentIndex = new Map();
@@ -553,12 +717,23 @@
       logStep(`upload ${i + 1} ok → ${url}`);
     }
 
-    // 2) Walk the plan and always append at the end of the doc. Plain
-     //    `insertContent` inserts at the current selection — after a chain of
-     //    inserts the cursor drifts in ways that make later calls clobber or
-     //    no-op. `insertContentAt(<end>, ...)` is explicit and idempotent.
-    const plan = planFromHtml(rawHtml);
-    logStep(`plan: ${plan.length} steps`);
+    // 2) Resolve every standalone JD link through SMZDM's native three-step
+    // product-card flow: search → add → long_article. The editor's own card
+    // storage performs add serialization and the final batch fetch.
+    const preparedProducts = await prepareProductCards(
+      articleId,
+      productSteps,
+      generateProductCards,
+    );
+
+    // 3) Walk the plan and always append at the end of the doc. Plain
+    // `insertContent` inserts at the current selection — after a chain of
+    // inserts the cursor drifts in ways that make later calls clobber or
+    // no-op. `insertContentAt(<end>, ...)` is explicit and idempotent.
+    setTitle(title);
+    logStep("title set");
+    let insertedProductCardCount = 0;
+    logStep(`plan: ${plan.length} steps, products=${productSteps.length}, generatedCards=${preparedProducts.generatedCount}, reusedCards=${preparedProducts.reusedCount}`);
     pageWindow.editor.commands.clearContent();
     for (let i = 0; i < plan.length; i += 1) {
       const step = plan[i];
@@ -567,17 +742,24 @@
         pageWindow.editor.commands.insertContentAt(endPos, step.html);
         continue;
       }
+      if (step.type === "product") {
+        const card = preparedProducts.cardsByKey.get(step.key);
+        if (card) {
+          pageWindow.editor.commands.insertContentAt(endPos, productCardHtml(card));
+          insertedProductCardCount += 1;
+          logStep(`step ${i + 1}/${plan.length}: product card ${step.key} @${endPos}`);
+        } else {
+          pageWindow.editor.commands.insertContentAt(endPos, step.html);
+          logStep(`step ${i + 1}/${plan.length}: product link ${step.key} (cards disabled)`);
+        }
+        continue;
+      }
       const occurrence = images[step.placeholder_index];
       if (!occurrence) throw new Error(`未找到占位图片: ${step.placeholder_index}`);
       const url = urlByAttachmentIndex.get(occurrence.attachment_index);
       if (!url) throw new Error(`未找到上传 URL: ${occurrence.local_path}`);
       pageWindow.editor.commands.insertContentAt(endPos, imageNode(url));
       logStep(`step ${i + 1}/${plan.length}: image @${endPos} → ${url}`);
-      if (preserveCards) {
-        const cardEndPos = pageWindow.editor.state.doc.content.size;
-        pageWindow.editor.commands.insertContentAt(cardEndPos, existingCards[step.placeholder_index]);
-        logStep(`step ${i + 1}/${plan.length}: preserved card @${cardEndPos}`);
-      }
     }
     logStep(`content inserted (html ${pageWindow.editor.getHTML().length} chars), waiting for autosave`);
 
@@ -604,7 +786,10 @@
       content_length: pageWindow.editor.getHTML().length,
       image_occurrence_count: Number(cmd.args?.image_occurrence_count) || images.length,
       unique_image_count: pageWindow.editor.commands.queryImageData().length,
-      preserved_card_count: existingCards.length,
+      product_link_count: productSteps.length,
+      generated_product_card_count: preparedProducts.generatedCount,
+      reused_product_card_count: preparedProducts.reusedCount,
+      inserted_product_card_count: insertedProductCardCount,
       autosave_status: autosave.lastStatus,
       autosave_url: autosave.lastUrl,
       submit_result: null,
@@ -661,11 +846,11 @@
           sendResult(msg.id, false, "正在处理上一条命令，请稍后再试");
           return;
         }
-      if (msg.action !== "draft" && msg.action !== "check-preserve-cards") {
-        sendResult(msg.id, false, `Unknown action for ${SITE}: ${msg.action}`);
-        return;
-      }
-      busy = true;
+        if (msg.action !== "draft" && msg.action !== "check-product-cards") {
+          sendResult(msg.id, false, `Unknown action for ${SITE}: ${msg.action}`);
+          return;
+        }
+        busy = true;
         saveDraftViaEditor(msg)
           .then((result) => sendResult(msg.id, true, result))
           .catch((error) => sendResult(msg.id, false, error.message || String(error)))

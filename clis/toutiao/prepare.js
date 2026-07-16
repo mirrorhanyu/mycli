@@ -8,7 +8,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const IMAGE_RE = /!\[(?<alt>[^\]]*)\]\((?<path>(?:[^()]|\([^()]*\))+)\)/g;
+const IMAGE_RE =
+  /!\[(?<alt>[^\]]*)\]\((?<path><[^>\n]+>|(?:[^()]|\([^()]*\))+)\)/g;
 // Comment-image: a Markdown comment whose body is a relative or absolute local image path.
 // Mirrors the Python COMMENT_IMAGE_PATTERN; multiline, matches anchored lines.
 const COMMENT_IMAGE_RE = /^(?<indent>[ \t]*)<!--\s*(?<path>(?:\.\.?\/|\/|稿件\/)[^<>]+?\.(?:jpe?g|png|webp))\s*-->\s*$/gm;
@@ -36,8 +37,18 @@ function isRemotePath(value) {
   return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value.trim());
 }
 
+function decodePathComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    // Local filenames commonly contain a literal `%` (for example
+    // "100% DCI-P3"). Treat malformed percent escapes as plain text.
+    return value;
+  }
+}
+
 function resolveImagePath(markdownPath, rawPath) {
-  const cleaned = decodeURIComponent(rawPath.trim().replace(/^<|>$/g, ""));
+  const cleaned = decodePathComponent(rawPath.trim().replace(/^<|>$/g, ""));
   if (cleaned.startsWith("/")) {
     return path.resolve(cleaned);
   }
