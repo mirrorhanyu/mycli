@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         mycli SMZDM Bridge
 // @namespace    local.mycli.smzdm
-// @version      0.3.13
+// @version      0.3.14
 // @description  WebSocket bridge to the mycli micro-daemon. Syncs the current SMZDM session and saves drafts through browser-side APIs.
 // @match        https://post.smzdm.com/post/*
 // @match        https://post.smzdm.com/edit/*
@@ -18,7 +18,7 @@
   "use strict";
 
   const SITE = "smzdm";
-  const VERSION = "0.3.13";
+  const VERSION = "0.3.14";
   const AUTOSAVE_URL_RE = /\/api\/editor\/article\/(submit|save)|\/api\/draft\//;
   // Tampermonkey sandboxes the script when any GM_* grant is declared. Page
   // globals like `editor` live on the real page window, accessible via
@@ -491,8 +491,20 @@
   function productKeyFromUrl(value) {
     let candidate = String(value || "").trim().replace(/&amp;/g, "&");
     for (let i = 0; i < 2; i += 1) {
-      const jd = candidate.match(/(?:https?:\/\/)?item\.jd\.com\/(\d+)\.html(?:[?#]|$)/i);
-      if (jd) return `jd:${jd[1]}`;
+      try {
+        const parsed = new URL(candidate);
+        const hostname = parsed.hostname.toLowerCase();
+        if (
+          parsed.protocol !== "https:" ||
+          (hostname !== "jd.com" && !hostname.endsWith(".jd.com"))
+        ) {
+          return null;
+        }
+        const skuMatch =
+          hostname === "item.jd.com" && /^\/(\d+)\.html\/?$/.exec(parsed.pathname);
+        if (skuMatch) return `jd:${skuMatch[1]}`;
+        return `jd-url:${hostname}${parsed.pathname}${parsed.search}`;
+      } catch {}
       try {
         const decoded = decodeURIComponent(candidate);
         if (decoded === candidate) break;
@@ -581,12 +593,11 @@
     return row;
   }
 
-  async function createProductCard(articleId, step) {
+  async function saveProductCard(row, step) {
     const storage = pageWindow.editor?.storage?.card;
     if (!storage || typeof storage.saveCardData !== "function") {
       throw new Error("当前编辑器不支持创建商品卡片");
     }
-    const row = await searchProductCard(articleId, step.url);
     const saved = await storage.saveCardData(row);
     const cardId = saved?.insert_id || saved?.res_id;
     if (!cardId) {
@@ -645,9 +656,20 @@
         continue;
       }
       setStatus(`draft: product ${i + 1}/${uniqueSteps.length}\n${step.key}`);
-      logStep(`product ${i + 1}/${uniqueSteps.length}: search + add ${step.url}`);
-      const card = await createProductCard(articleId, step);
+      logStep(`product ${i + 1}/${uniqueSteps.length}: search ${step.url}`);
+      const row = await searchProductCard(articleId, step.url);
+      const canonicalKey = productKeyFromUrl(row.article_url);
+      const existing = canonicalKey ? cardsByKey.get(canonicalKey) : null;
+      if (existing) {
+        cardsByKey.set(step.key, existing);
+        reusedCount += 1;
+        logStep(`product ${i + 1}: resolved ${step.key} → existing ${canonicalKey}`);
+        continue;
+      }
+      logStep(`product ${i + 1}/${uniqueSteps.length}: add ${row.article_url || step.url}`);
+      const card = await saveProductCard(row, step);
       cardsByKey.set(step.key, card);
+      if (canonicalKey) cardsByKey.set(canonicalKey, card);
       generatedCount += 1;
       logStep(`product ${i + 1} ok → card_id=${card.card_id}`);
     }
@@ -658,7 +680,11 @@
     }
     storage.cardIds?.clear?.();
     storage.productItemIds?.clear?.();
-    for (const card of cardsByKey.values()) storage.setCardId(card.card_id);
+    for (const card of new Map(
+      [...cardsByKey.values()].map((item) => [item.card_id, item]),
+    ).values()) {
+      storage.setCardId(card.card_id);
+    }
     await storage.fetchCardData();
 
     return { cardsByKey, generatedCount, reusedCount };

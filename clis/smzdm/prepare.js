@@ -14,11 +14,30 @@ function decodeHtml(value) {
     .replace(/&gt;/g, ">");
 }
 
-function jdSkuFromUrl(value) {
+function parseJdProductUrl(value) {
   let candidate = decodeHtml(value).trim();
   for (let i = 0; i < 2; i += 1) {
-    const match = candidate.match(/(?:https?:\/\/)?item\.jd\.com\/(\d+)\.html(?:[?#]|$)/i);
-    if (match) return match[1];
+    try {
+      const parsed = new URL(candidate);
+      const hostname = parsed.hostname.toLowerCase();
+      if (
+        parsed.protocol !== "https:" ||
+        (hostname !== "jd.com" && !hostname.endsWith(".jd.com"))
+      ) {
+        return null;
+      }
+      parsed.hash = "";
+      const skuMatch =
+        hostname === "item.jd.com" && /^\/(\d+)\.html\/?$/.exec(parsed.pathname);
+      const sku = skuMatch?.[1] || null;
+      return {
+        sku,
+        key: sku
+          ? `jd:${sku}`
+          : `jd-url:${hostname}${parsed.pathname}${parsed.search}`,
+        url: parsed.toString(),
+      };
+    } catch {}
     try {
       const decoded = decodeURIComponent(candidate);
       if (decoded === candidate) break;
@@ -30,18 +49,21 @@ function jdSkuFromUrl(value) {
   return null;
 }
 
+function jdSkuFromUrl(value) {
+  return parseJdProductUrl(value)?.sku || null;
+}
+
 function extractProductLinks(html) {
   const links = [];
   for (const match of String(html).matchAll(STANDALONE_LINK_RE)) {
-    const url = decodeHtml(match.groups.href);
-    const sku = jdSkuFromUrl(url);
-    if (!sku) continue;
+    const product = parseJdProductUrl(match.groups.href);
+    if (!product) continue;
     links.push({
       index: links.length,
       platform: "jd",
-      sku,
-      key: `jd:${sku}`,
-      url,
+      sku: product.sku,
+      key: product.key,
+      url: product.url,
       label: decodeHtml(match.groups.label).replace(/<[^>]+>/g, "").trim(),
     });
   }
@@ -63,4 +85,5 @@ module.exports = {
   markdownToHtml,
   extractProductLinks,
   jdSkuFromUrl,
+  parseJdProductUrl,
 };
